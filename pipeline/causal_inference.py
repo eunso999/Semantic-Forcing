@@ -293,6 +293,10 @@ class CausalInferencePipeline(torch.nn.Module):
                 # Per-token original position indices (preserved across compressions)
                 "token_temporal_indices": torch.zeros([batch_size, kv_cache_size], dtype=torch.long, device=blk_device),
                 "token_spatial_indices": torch.zeros([batch_size, kv_cache_size], dtype=torch.long, device=blk_device),
+                # cluster compression: per-prototype running-mean spatial position (float),
+                # one entry per memory slot (frame_seq_length). Seeded to identity (h,w).
+                "proto_spatial_long": torch.arange(self.frame_seq_length, dtype=torch.float32, device=blk_device).unsqueeze(0).expand(batch_size, -1).clone(),
+                "proto_spatial_short": torch.arange(self.frame_seq_length, dtype=torch.float32, device=blk_device).unsqueeze(0).expand(batch_size, -1).clone(),
                 # For output_preserve compression: store selection computed at t=1000
                 "selected_token_indices": None,
                 "original_spatial_indices": None

@@ -15,6 +15,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from torch.nn.attention.flex_attention import BlockMask
 from diffusers.models.modeling_utils import ModelMixin
 import torch.nn as nn
+import torch.nn.functional as F
 import torch
 import math
 import torch.distributed as dist
@@ -223,6 +224,89 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0, relative_frame_indice
     return torch.stack(output).type_as(x)
 
 
+def rope_apply_by_index(x, freqs, temporal_idx, h_idx, w_idx):
+    """Apply RoPE to every token using explicit per-token (t, h, w) integer indices.
+
+    Unlike ``causal_rope_apply`` (which derives spatial position from a token's
+    physical (h, w) location inside a reshaped frame), this gathers the rotary
+    frequency for each token independently. This lets content-merged memory
+    tokens carry a *representative* spatial position that differs from their slot.
+
+    Args:
+        x:            [B, L, n, D] tokens to rotate (RoPE applies to Q/K only).
+        freqs:        precomputed rotary table, [max_pos, D/2] complex.
+        temporal_idx: [L] long, temporal (frame) index per token.
+        h_idx:        [L] long, height index per token.
+        w_idx:        [L] long, width index per token.
+
+    Returns:
+        [B, L, n, D] rotated tensor, same dtype as ``x``.
+    """
+    b, L, n, D = x.shape
+    c = D // 2
+    freq_t, freq_h, freq_w = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    # Clamp to the precomputed table range (indices never exceed training range).
+    ti = temporal_idx.long().clamp(0, freq_t.shape[0] - 1)
+    hi = h_idx.long().clamp(0, freq_h.shape[0] - 1)
+    wi = w_idx.long().clamp(0, freq_w.shape[0] - 1)
+    freq = torch.cat([freq_t[ti], freq_h[hi], freq_w[wi]], dim=-1)  # [L, c] complex
+    freq = freq.view(1, L, 1, c)
+    x_c = torch.view_as_complex(x[:, :L].to(torch.float64).reshape(b, L, n, c, 2))
+    out = torch.view_as_real(x_c * freq).flatten(3)
+    return out.type_as(x)
+
+
+def cluster_merge_update(evicted_k, evicted_v, evicted_spatial,
+                         proto_k, proto_v, proto_spatial, alpha):
+    """Content-aware online clustering update of memory prototypes.
+
+    Each evicted (un-roped) token is hard-assigned to the most cosine-similar
+    memory prototype (over flattened heads); every prototype is then EMA-updated
+    toward the mean of the tokens assigned to it. Prototypes that receive no
+    token are left unchanged. This generalizes per-(h,w) EMA: it merges by
+    *content* rather than by spatial slot. Deterministic (argmax + matmul
+    aggregation; no scatter_add), so it is safe under
+    ``torch.use_deterministic_algorithms(True)``.
+
+    Args:
+        evicted_k/evicted_v: [B, E, n, d] un-roped keys/values leaving the window.
+        evicted_spatial:     [B, E] original spatial index (0..frame_seqlen-1).
+        proto_k/proto_v:     [B, M, n, d] current memory prototypes.
+        proto_spatial:       [B, M] float running-mean spatial position.
+        alpha:               scalar EMA rate.
+
+    Returns:
+        new_proto_k, new_proto_v: [B, M, n, d]
+        new_proto_spatial:        [B, M] float
+    """
+    B, E, n, d = evicted_k.shape
+    M = proto_k.shape[1]
+
+    # Similarity in float32 for stability/determinism (bf16 accumulation is lossy).
+    e_feat = F.normalize(evicted_k.reshape(B, E, n * d).float(), dim=-1)
+    p_feat = F.normalize(proto_k.reshape(B, M, n * d).float(), dim=-1)
+    sim = torch.matmul(e_feat, p_feat.transpose(1, 2))        # [B, E, M]
+    assign = sim.argmax(dim=-1)                               # [B, E]
+    A = F.one_hot(assign, num_classes=M).float()             # [B, E, M]
+    counts = A.sum(dim=1)                                     # [B, M]
+
+    # Assigned-token means via matmul (deterministic), float32 accumulation.
+    sum_k = torch.einsum('bem,bend->bmnd', A, evicted_k.float())
+    sum_v = torch.einsum('bem,bend->bmnd', A, evicted_v.float())
+    sum_s = torch.einsum('bem,be->bm', A, evicted_spatial.float())
+    denom = counts.clamp(min=1.0)                             # avoid div-by-zero
+    mean_k = sum_k / denom.view(B, M, 1, 1)
+    mean_v = sum_v / denom.view(B, M, 1, 1)
+    mean_s = sum_s / denom                                    # [B, M]
+
+    # EMA only where a prototype actually received tokens.
+    mask = (counts > 0).float()                              # [B, M]
+    mk = mask.view(B, M, 1, 1)
+    new_k = proto_k.float() + alpha * mk * (mean_k - proto_k.float())
+    new_v = proto_v.float() + alpha * mk * (mean_v - proto_v.float())
+    new_s = proto_spatial + alpha * mask * (mean_s - proto_spatial)
+    return new_k.type_as(proto_k), new_v.type_as(proto_v), new_s
+
 
 class CausalWanSelfAttention(nn.Module):
 
@@ -252,7 +336,7 @@ class CausalWanSelfAttention(nn.Module):
             ema_adaptive: if True, use per-token motion-based adaptive alpha (default False)
         """
         assert dim % num_heads == 0
-        assert compression_method in ['eviction', 'ema']
+        assert compression_method in ['eviction', 'ema', 'cluster']
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -423,8 +507,13 @@ class CausalWanSelfAttention(nn.Module):
                 temp_k = kv_cache["k"].clone()
                 temp_v = kv_cache["v"].clone()
 
-                if self.compression_method == 'ema':
-                    # === EMA MEMORY COMPRESSION ===
+                if self.compression_method in ('ema', 'cluster'):
+                    # === EMA / CLUSTER MEMORY COMPRESSION ===
+                    # 'ema':     memory slots are fixed (h,w) bins updated per-position.
+                    # 'cluster': memory slots are content prototypes; evicted tokens are
+                    #            merged into the most similar prototype (content-aware),
+                    #            and each prototype tracks a representative spatial position.
+                    is_cluster = self.compression_method == 'cluster'
                     # Cache structure: [Sink 3] + [Long-term EMA 1] + [Short-term EMA 1] + [Recent 4] + [New 3] = 12
                     # Long-term EMA: slow update (small alpha) - retains distant past
                     # Short-term EMA: fast update (large alpha) - captures recent trends
@@ -461,6 +550,10 @@ class CausalWanSelfAttention(nn.Module):
                     alpha_short_for_cache = self.ema_alpha_short
                     evicted_k_for_cache = None
                     evicted_v_for_cache = None
+                    # cluster-mode: final merged prototypes + representative spatial positions
+                    cluster_long_k = cluster_long_v = None
+                    cluster_short_k = cluster_short_v = None
+                    proto_spatial_long_new = proto_spatial_short_new = None
 
                     if is_recompute:
                         # At recompute, cache already has updated layout from t=1000
@@ -482,7 +575,21 @@ class CausalWanSelfAttention(nn.Module):
                         # t=1000: Build new layout with EMA update
                         ema_initialized = "ema_initialized" in kv_cache and kv_cache["ema_initialized"]
 
-                        if not ema_initialized:
+                        if not ema_initialized and is_cluster:
+                            # Cluster init: seed prototypes with the first recent frame
+                            # (identity — prototype j starts at spatial position j).
+                            seed_k = kv_cache["k"][:, recent_start:recent_start + frame_seqlen].clone()
+                            seed_v = kv_cache["v"][:, recent_start:recent_start + frame_seqlen].clone()
+                            temp_k[:, ema_long_start:ema_long_end] = seed_k
+                            temp_v[:, ema_long_start:ema_long_end] = seed_v
+                            temp_k[:, ema_short_start:ema_short_end] = seed_k
+                            temp_v[:, ema_short_start:ema_short_end] = seed_v
+                            cluster_long_k, cluster_long_v = seed_k, seed_v
+                            cluster_short_k, cluster_short_v = seed_k, seed_v
+                            init_spatial = torch.arange(frame_seqlen, device=k.device, dtype=torch.float32)
+                            proto_spatial_long_new = init_spatial.unsqueeze(0).expand(b, -1).clone()
+                            proto_spatial_short_new = proto_spatial_long_new.clone()
+                        elif not ema_initialized:
                             # First time: initialize EMA
                             if num_evicted_tokens > 0:
                                 evicted_k = kv_cache["k"][:, recent_start:recent_start + num_evicted_tokens]
@@ -520,47 +627,65 @@ class CausalWanSelfAttention(nn.Module):
                                 evicted_k = kv_cache["k"][:, recent_start:recent_start + num_evicted_tokens]
                                 evicted_v = kv_cache["v"][:, recent_start:recent_start + num_evicted_tokens]
 
-                                if self.ema_adaptive and num_evicted_tokens >= frame_seqlen:
-                                    # Per-position mean: preserves spatial structure
-                                    num_evicted_frames = num_evicted_tokens // frame_seqlen
-                                    evicted_k_mean = evicted_k[:, :num_evicted_frames * frame_seqlen].view(
-                                        b, num_evicted_frames, frame_seqlen, n, d).mean(dim=1)
-                                    evicted_v_mean = evicted_v[:, :num_evicted_frames * frame_seqlen].view(
-                                        b, num_evicted_frames, frame_seqlen, n, d).mean(dim=1)
-
-                                    # Long-term EMA: uniform alpha (stable global scene summary)
-                                    alpha_long = self.ema_alpha_long
-
-                                    # Short-term EMA: adaptive per-token alpha based on motion
-                                    motion_short = (evicted_k_mean - old_ema_short_k).norm(dim=-1).mean(dim=-1)  # [B, frame_seqlen]
-                                    motion_short_norm = motion_short / (motion_short.max(dim=-1, keepdim=True).values + 1e-8)  # [0, 1]
-
-                                    alpha_short_min = self.ema_alpha_short * 0.1
-                                    alpha_short_max = self.ema_alpha_short * 5.0
-                                    alpha_short = (alpha_short_min + motion_short_norm * (alpha_short_max - alpha_short_min)).unsqueeze(-1).unsqueeze(-1)  # [B, frame_seqlen, 1, 1]
+                                if is_cluster:
+                                    # Content-aware merge into the most similar prototype.
+                                    # Recent tokens are still un-merged, so their original
+                                    # spatial index is simply position % frame_seqlen.
+                                    evicted_spatial = (torch.arange(num_evicted_tokens, device=k.device) % frame_seqlen).unsqueeze(0).expand(b, -1)
+                                    old_ps_long = kv_cache["proto_spatial_long"].clone()
+                                    old_ps_short = kv_cache["proto_spatial_short"].clone()
+                                    cluster_long_k, cluster_long_v, proto_spatial_long_new = cluster_merge_update(
+                                        evicted_k, evicted_v, evicted_spatial,
+                                        old_ema_long_k, old_ema_long_v, old_ps_long, self.ema_alpha_long)
+                                    cluster_short_k, cluster_short_v, proto_spatial_short_new = cluster_merge_update(
+                                        evicted_k, evicted_v, evicted_spatial,
+                                        old_ema_short_k, old_ema_short_v, old_ps_short, self.ema_alpha_short)
+                                    temp_k[:, ema_long_start:ema_long_end] = cluster_long_k
+                                    temp_v[:, ema_long_start:ema_long_end] = cluster_long_v
+                                    temp_k[:, ema_short_start:ema_short_end] = cluster_short_k
+                                    temp_v[:, ema_short_start:ema_short_end] = cluster_short_v
                                 else:
-                                    # Original: global mean, scalar alpha
-                                    evicted_k_mean = evicted_k.mean(dim=1, keepdim=True).expand(-1, frame_seqlen, -1, -1)
-                                    evicted_v_mean = evicted_v.mean(dim=1, keepdim=True).expand(-1, frame_seqlen, -1, -1)
-                                    alpha_long = self.ema_alpha_long
-                                    alpha_short = self.ema_alpha_short
+                                    if self.ema_adaptive and num_evicted_tokens >= frame_seqlen:
+                                        # Per-position mean: preserves spatial structure
+                                        num_evicted_frames = num_evicted_tokens // frame_seqlen
+                                        evicted_k_mean = evicted_k[:, :num_evicted_frames * frame_seqlen].view(
+                                            b, num_evicted_frames, frame_seqlen, n, d).mean(dim=1)
+                                        evicted_v_mean = evicted_v[:, :num_evicted_frames * frame_seqlen].view(
+                                            b, num_evicted_frames, frame_seqlen, n, d).mean(dim=1)
 
-                                # EMA update (works with both scalar and per-token alpha)
-                                new_ema_long_k = alpha_long * evicted_k_mean + (1 - alpha_long) * old_ema_long_k
-                                new_ema_long_v = alpha_long * evicted_v_mean + (1 - alpha_long) * old_ema_long_v
-                                new_ema_short_k = alpha_short * evicted_k_mean + (1 - alpha_short) * old_ema_short_k
-                                new_ema_short_v = alpha_short * evicted_v_mean + (1 - alpha_short) * old_ema_short_v
+                                        # Long-term EMA: uniform alpha (stable global scene summary)
+                                        alpha_long = self.ema_alpha_long
 
-                                temp_k[:, ema_long_start:ema_long_end] = new_ema_long_k
-                                temp_v[:, ema_long_start:ema_long_end] = new_ema_long_v
-                                temp_k[:, ema_short_start:ema_short_end] = new_ema_short_k
-                                temp_v[:, ema_short_start:ema_short_end] = new_ema_short_v
+                                        # Short-term EMA: adaptive per-token alpha based on motion
+                                        motion_short = (evicted_k_mean - old_ema_short_k).norm(dim=-1).mean(dim=-1)  # [B, frame_seqlen]
+                                        motion_short_norm = motion_short / (motion_short.max(dim=-1, keepdim=True).values + 1e-8)  # [0, 1]
 
-                                # Store for _apply_cache_updates
-                                alpha_long_for_cache = alpha_long
-                                alpha_short_for_cache = alpha_short
-                                evicted_k_for_cache = evicted_k_mean
-                                evicted_v_for_cache = evicted_v_mean
+                                        alpha_short_min = self.ema_alpha_short * 0.1
+                                        alpha_short_max = self.ema_alpha_short * 5.0
+                                        alpha_short = (alpha_short_min + motion_short_norm * (alpha_short_max - alpha_short_min)).unsqueeze(-1).unsqueeze(-1)  # [B, frame_seqlen, 1, 1]
+                                    else:
+                                        # Original: global mean, scalar alpha
+                                        evicted_k_mean = evicted_k.mean(dim=1, keepdim=True).expand(-1, frame_seqlen, -1, -1)
+                                        evicted_v_mean = evicted_v.mean(dim=1, keepdim=True).expand(-1, frame_seqlen, -1, -1)
+                                        alpha_long = self.ema_alpha_long
+                                        alpha_short = self.ema_alpha_short
+
+                                    # EMA update (works with both scalar and per-token alpha)
+                                    new_ema_long_k = alpha_long * evicted_k_mean + (1 - alpha_long) * old_ema_long_k
+                                    new_ema_long_v = alpha_long * evicted_v_mean + (1 - alpha_long) * old_ema_long_v
+                                    new_ema_short_k = alpha_short * evicted_k_mean + (1 - alpha_short) * old_ema_short_k
+                                    new_ema_short_v = alpha_short * evicted_v_mean + (1 - alpha_short) * old_ema_short_v
+
+                                    temp_k[:, ema_long_start:ema_long_end] = new_ema_long_k
+                                    temp_v[:, ema_long_start:ema_long_end] = new_ema_long_v
+                                    temp_k[:, ema_short_start:ema_short_end] = new_ema_short_k
+                                    temp_v[:, ema_short_start:ema_short_end] = new_ema_short_v
+
+                                    # Store for _apply_cache_updates
+                                    alpha_long_for_cache = alpha_long
+                                    alpha_short_for_cache = alpha_short
+                                    evicted_k_for_cache = evicted_k_mean
+                                    evicted_v_for_cache = evicted_v_mean
                             else:
                                 # No evicted tokens, keep old EMA
                                 temp_k[:, ema_long_start:ema_long_end] = old_ema_long_k
@@ -599,10 +724,36 @@ class CausalWanSelfAttention(nn.Module):
                     ).type_as(v)
 
                     cache_relative_indices = torch.arange(0, num_cache_frames, device=k.device)
-                    roped_temp_k = causal_rope_apply(
-                        temp_k[:, :local_end_index].view(b, num_cache_frames, frame_seqlen, n, d).flatten(1, 2),
-                        cache_grid_sizes, freqs, relative_frame_indices=cache_relative_indices
-                    ).type_as(v)
+                    if is_cluster:
+                        # Spatial-aware RoPE: memory frames (long/short, right after the
+                        # sink) carry each prototype's representative spatial position
+                        # instead of their physical slot's (h, w). Sink/recent/new keep
+                        # their native positions (identical to causal_rope_apply there).
+                        w_grid = int(grid_sizes[0, 2].item())
+                        cache_tok = temp_k[:, :local_end_index].view(
+                            b, num_cache_frames, frame_seqlen, n, d).flatten(1, 2)
+                        tok = torch.arange(local_end_index, device=k.device)
+                        fi = tok // frame_seqlen
+                        spatial_local = (tok % frame_seqlen).clone()
+                        # current valid proto spatial (freshly computed at t=1000, else cached)
+                        cur_ps_long = proto_spatial_long_new if proto_spatial_long_new is not None else kv_cache["proto_spatial_long"]
+                        cur_ps_short = proto_spatial_short_new if proto_spatial_short_new is not None else kv_cache["proto_spatial_short"]
+                        ps_long = cur_ps_long[0].round().long().clamp(0, frame_seqlen - 1)
+                        ps_short = cur_ps_short[0].round().long().clamp(0, frame_seqlen - 1)
+                        if num_cache_frames > self.sink_size:
+                            spatial_local[fi == self.sink_size] = ps_long
+                        if num_cache_frames > self.sink_size + 1:
+                            spatial_local[fi == self.sink_size + 1] = ps_short
+                        temporal_idx = cache_relative_indices[fi]
+                        h_idx = spatial_local // w_grid
+                        w_idx = spatial_local % w_grid
+                        roped_temp_k = rope_apply_by_index(
+                            cache_tok, freqs, temporal_idx, h_idx, w_idx).type_as(v)
+                    else:
+                        roped_temp_k = causal_rope_apply(
+                            temp_k[:, :local_end_index].view(b, num_cache_frames, frame_seqlen, n, d).flatten(1, 2),
+                            cache_grid_sizes, freqs, relative_frame_indices=cache_relative_indices
+                        ).type_as(v)
 
                     # Compute temporal/spatial indices for new tokens
                     new_token_positions = torch.arange(num_new_tokens, device=q.device)
@@ -630,6 +781,14 @@ class CausalWanSelfAttention(nn.Module):
                         "evicted_k_mean": evicted_k_for_cache,
                         "evicted_v_mean": evicted_v_for_cache,
                         "ema_adaptive": self.ema_adaptive,
+                        # cluster-mode: final merged prototypes + representative positions
+                        "is_cluster": is_cluster,
+                        "cluster_long_k": cluster_long_k,
+                        "cluster_long_v": cluster_long_v,
+                        "cluster_short_k": cluster_short_k,
+                        "cluster_short_v": cluster_short_v,
+                        "proto_spatial_long": proto_spatial_long_new,
+                        "proto_spatial_short": proto_spatial_short_new,
                     }
 
                 else:
@@ -1309,54 +1468,74 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     if not is_recompute:
                         current_local_end = cache["local_end_index"].item()
 
-                        # Check if EMA is initialized
-                        ema_initialized = "ema_initialized" in cache and cache["ema_initialized"]
-
-                        if not ema_initialized:
-                            # First time: use pre-computed values from forward()
-                            if evicted_k_mean_from_fwd is not None:
-                                cache["k"][:, ema_long_start:ema_long_end] = evicted_k_mean_from_fwd
-                                cache["v"][:, ema_long_start:ema_long_end] = evicted_v_mean_from_fwd
-                                cache["k"][:, ema_short_start:ema_short_end] = evicted_k_mean_from_fwd
-                                cache["v"][:, ema_short_start:ema_short_end] = evicted_v_mean_from_fwd
-                            elif num_evicted_tokens > 0:
-                                evicted_k = cache["k"][:, recent_start:recent_start + num_evicted_tokens]
-                                evicted_v = cache["v"][:, recent_start:recent_start + num_evicted_tokens]
-                                evicted_k_mean = evicted_k.mean(dim=1, keepdim=True).expand(-1, frame_seqlen, -1, -1)
-                                evicted_v_mean = evicted_v.mean(dim=1, keepdim=True).expand(-1, frame_seqlen, -1, -1)
-                                cache["k"][:, ema_long_start:ema_long_end] = evicted_k_mean
-                                cache["v"][:, ema_long_start:ema_long_end] = evicted_v_mean
-                                cache["k"][:, ema_short_start:ema_short_end] = evicted_k_mean
-                                cache["v"][:, ema_short_start:ema_short_end] = evicted_v_mean
-                            else:
-                                cache["k"][:, ema_long_start:ema_long_end] = cache["k"][:, recent_start:recent_start + frame_seqlen].clone()
-                                cache["v"][:, ema_long_start:ema_long_end] = cache["v"][:, recent_start:recent_start + frame_seqlen].clone()
-                                cache["k"][:, ema_short_start:ema_short_end] = cache["k"][:, recent_start:recent_start + frame_seqlen].clone()
-                                cache["v"][:, ema_short_start:ema_short_end] = cache["v"][:, recent_start:recent_start + frame_seqlen].clone()
+                        if update_info.get("is_cluster", False):
+                            # Cluster: forward() already computed the merged prototypes
+                            # (init or update); just write them and the proto positions.
+                            clk = update_info.get("cluster_long_k")
+                            if clk is not None:
+                                cache["k"][:, ema_long_start:ema_long_end] = clk
+                                cache["v"][:, ema_long_start:ema_long_end] = update_info["cluster_long_v"]
+                                cache["k"][:, ema_short_start:ema_short_end] = update_info["cluster_short_k"]
+                                cache["v"][:, ema_short_start:ema_short_end] = update_info["cluster_short_v"]
+                            psl = update_info.get("proto_spatial_long")
+                            if psl is not None:
+                                pss = update_info["proto_spatial_short"]
+                                cache["proto_spatial_long"] = psl
+                                cache["proto_spatial_short"] = pss
+                                # Mirror rounded positions into the integer index buffer.
+                                if "token_spatial_indices" in cache:
+                                    cache["token_spatial_indices"][:, ema_long_start:ema_long_end] = psl.round().long().clamp(0, frame_seqlen - 1)
+                                    cache["token_spatial_indices"][:, ema_short_start:ema_short_end] = pss.round().long().clamp(0, frame_seqlen - 1)
                             cache["ema_initialized"] = True
                         else:
-                            # Update EMA using alpha tensors from forward()
-                            if num_evicted_tokens > 0:
-                                old_ema_long_k = cache["k"][:, ema_long_start:ema_long_end].clone()
-                                old_ema_long_v = cache["v"][:, ema_long_start:ema_long_end].clone()
-                                old_ema_short_k = cache["k"][:, ema_short_start:ema_short_end].clone()
-                                old_ema_short_v = cache["v"][:, ema_short_start:ema_short_end].clone()
+                            # Check if EMA is initialized
+                            ema_initialized = "ema_initialized" in cache and cache["ema_initialized"]
 
-                                # Use pre-computed evicted mean from forward() if available
+                            if not ema_initialized:
+                                # First time: use pre-computed values from forward()
                                 if evicted_k_mean_from_fwd is not None:
-                                    evicted_k_mean = evicted_k_mean_from_fwd
-                                    evicted_v_mean = evicted_v_mean_from_fwd
-                                else:
+                                    cache["k"][:, ema_long_start:ema_long_end] = evicted_k_mean_from_fwd
+                                    cache["v"][:, ema_long_start:ema_long_end] = evicted_v_mean_from_fwd
+                                    cache["k"][:, ema_short_start:ema_short_end] = evicted_k_mean_from_fwd
+                                    cache["v"][:, ema_short_start:ema_short_end] = evicted_v_mean_from_fwd
+                                elif num_evicted_tokens > 0:
                                     evicted_k = cache["k"][:, recent_start:recent_start + num_evicted_tokens]
                                     evicted_v = cache["v"][:, recent_start:recent_start + num_evicted_tokens]
                                     evicted_k_mean = evicted_k.mean(dim=1, keepdim=True).expand(-1, frame_seqlen, -1, -1)
                                     evicted_v_mean = evicted_v.mean(dim=1, keepdim=True).expand(-1, frame_seqlen, -1, -1)
+                                    cache["k"][:, ema_long_start:ema_long_end] = evicted_k_mean
+                                    cache["v"][:, ema_long_start:ema_long_end] = evicted_v_mean
+                                    cache["k"][:, ema_short_start:ema_short_end] = evicted_k_mean
+                                    cache["v"][:, ema_short_start:ema_short_end] = evicted_v_mean
+                                else:
+                                    cache["k"][:, ema_long_start:ema_long_end] = cache["k"][:, recent_start:recent_start + frame_seqlen].clone()
+                                    cache["v"][:, ema_long_start:ema_long_end] = cache["v"][:, recent_start:recent_start + frame_seqlen].clone()
+                                    cache["k"][:, ema_short_start:ema_short_end] = cache["k"][:, recent_start:recent_start + frame_seqlen].clone()
+                                    cache["v"][:, ema_short_start:ema_short_end] = cache["v"][:, recent_start:recent_start + frame_seqlen].clone()
+                                cache["ema_initialized"] = True
+                            else:
+                                # Update EMA using alpha tensors from forward()
+                                if num_evicted_tokens > 0:
+                                    old_ema_long_k = cache["k"][:, ema_long_start:ema_long_end].clone()
+                                    old_ema_long_v = cache["v"][:, ema_long_start:ema_long_end].clone()
+                                    old_ema_short_k = cache["k"][:, ema_short_start:ema_short_end].clone()
+                                    old_ema_short_v = cache["v"][:, ema_short_start:ema_short_end].clone()
 
-                                # alpha_long/alpha_short are either scalar or [B, frame_seqlen, 1, 1] tensor
-                                cache["k"][:, ema_long_start:ema_long_end] = alpha_long * evicted_k_mean + (1 - alpha_long) * old_ema_long_k
-                                cache["v"][:, ema_long_start:ema_long_end] = alpha_long * evicted_v_mean + (1 - alpha_long) * old_ema_long_v
-                                cache["k"][:, ema_short_start:ema_short_end] = alpha_short * evicted_k_mean + (1 - alpha_short) * old_ema_short_k
-                                cache["v"][:, ema_short_start:ema_short_end] = alpha_short * evicted_v_mean + (1 - alpha_short) * old_ema_short_v
+                                    # Use pre-computed evicted mean from forward() if available
+                                    if evicted_k_mean_from_fwd is not None:
+                                        evicted_k_mean = evicted_k_mean_from_fwd
+                                        evicted_v_mean = evicted_v_mean_from_fwd
+                                    else:
+                                        evicted_k = cache["k"][:, recent_start:recent_start + num_evicted_tokens]
+                                        evicted_v = cache["v"][:, recent_start:recent_start + num_evicted_tokens]
+                                        evicted_k_mean = evicted_k.mean(dim=1, keepdim=True).expand(-1, frame_seqlen, -1, -1)
+                                        evicted_v_mean = evicted_v.mean(dim=1, keepdim=True).expand(-1, frame_seqlen, -1, -1)
+
+                                    # alpha_long/alpha_short are either scalar or [B, frame_seqlen, 1, 1] tensor
+                                    cache["k"][:, ema_long_start:ema_long_end] = alpha_long * evicted_k_mean + (1 - alpha_long) * old_ema_long_k
+                                    cache["v"][:, ema_long_start:ema_long_end] = alpha_long * evicted_v_mean + (1 - alpha_long) * old_ema_long_v
+                                    cache["k"][:, ema_short_start:ema_short_end] = alpha_short * evicted_k_mean + (1 - alpha_short) * old_ema_short_k
+                                    cache["v"][:, ema_short_start:ema_short_end] = alpha_short * evicted_v_mean + (1 - alpha_short) * old_ema_short_v
 
                         # FIFO shift Recent
                         remaining_recent = local_start_index - ema_short_end
