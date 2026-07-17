@@ -256,8 +256,47 @@ def rope_apply_by_index(x, freqs, temporal_idx, h_idx, w_idx):
     return out.type_as(x)
 
 
+# ---------------------------------------------------------------------------
+# Cluster similarity instrumentation (analysis only).
+# Disabled by default (log is None) so it has ZERO effect on normal runs.
+# When enabled, `cluster_merge_update` records, for each evicted token, the
+# cosine similarity to its top-1 (argmax) prototype, tagged by chunk index,
+# transformer block index, and branch ('long'/'short').
+# ---------------------------------------------------------------------------
+_CLUSTER_SIM_LOG = None  # None disables; a list enables recording.
+
+
+def enable_cluster_sim_logging(enabled=True):
+    """Turn top-1 cosine-similarity logging on (fresh list) or off (None)."""
+    global _CLUSTER_SIM_LOG
+    _CLUSTER_SIM_LOG = [] if enabled else None
+
+
+def get_cluster_sim_log():
+    """Return the accumulated list of per-call similarity records (or None)."""
+    return _CLUSTER_SIM_LOG
+
+
+def _record_cluster_sim(chunk_idx, block_idx, branch, top1):
+    """top1: [B, E] cosine sim of each evicted token to its assigned prototype."""
+    if _CLUSTER_SIM_LOG is None:
+        return
+    t = top1.detach().float().reshape(-1)
+    _CLUSTER_SIM_LOG.append({
+        "chunk": int(chunk_idx),
+        "block": int(block_idx),
+        "branch": branch,
+        "min": float(t.min()),
+        "max": float(t.max()),
+        "mean": float(t.mean()),
+        "sum": float(t.sum()),
+        "count": int(t.numel()),
+    })
+
+
 def cluster_merge_update(evicted_k, evicted_v, evicted_spatial,
-                         proto_k, proto_v, proto_spatial, alpha):
+                         proto_k, proto_v, proto_spatial, alpha,
+                         sim_log_ctx=None):
     """Content-aware online clustering update of memory prototypes.
 
     Each evicted (un-roped) token is hard-assigned to the most cosine-similar
@@ -287,6 +326,9 @@ def cluster_merge_update(evicted_k, evicted_v, evicted_spatial,
     p_feat = F.normalize(proto_k.reshape(B, M, n * d).float(), dim=-1)
     sim = torch.matmul(e_feat, p_feat.transpose(1, 2))        # [B, E, M]
     assign = sim.argmax(dim=-1)                               # [B, E]
+    if sim_log_ctx is not None:
+        # Record cosine sim of each evicted token to its top-1 prototype.
+        _record_cluster_sim(*sim_log_ctx, sim.max(dim=-1).values)
     A = F.one_hot(assign, num_classes=M).float()             # [B, E, M]
     counts = A.sum(dim=1)                                     # [B, M]
 
@@ -366,6 +408,9 @@ class CausalWanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        # Transformer block index, set by the parent model after block construction.
+        # Used only for cluster-similarity instrumentation (per-block analysis).
+        self.block_index = -1
 
     def forward(
         self,
@@ -634,12 +679,16 @@ class CausalWanSelfAttention(nn.Module):
                                     evicted_spatial = (torch.arange(num_evicted_tokens, device=k.device) % frame_seqlen).unsqueeze(0).expand(b, -1)
                                     old_ps_long = kv_cache["proto_spatial_long"].clone()
                                     old_ps_short = kv_cache["proto_spatial_short"].clone()
+                                    # Autoregressive chunk index (for similarity instrumentation).
+                                    _sim_chunk_idx = int(current_start // frame_seqlen) // max(int(num_new_frames), 1)
                                     cluster_long_k, cluster_long_v, proto_spatial_long_new = cluster_merge_update(
                                         evicted_k, evicted_v, evicted_spatial,
-                                        old_ema_long_k, old_ema_long_v, old_ps_long, self.ema_alpha_long)
+                                        old_ema_long_k, old_ema_long_v, old_ps_long, self.ema_alpha_long,
+                                        sim_log_ctx=(_sim_chunk_idx, self.block_index, 'long'))
                                     cluster_short_k, cluster_short_v, proto_spatial_short_new = cluster_merge_update(
                                         evicted_k, evicted_v, evicted_spatial,
-                                        old_ema_short_k, old_ema_short_v, old_ps_short, self.ema_alpha_short)
+                                        old_ema_short_k, old_ema_short_v, old_ps_short, self.ema_alpha_short,
+                                        sim_log_ctx=(_sim_chunk_idx, self.block_index, 'short'))
                                     temp_k[:, ema_long_start:ema_long_end] = cluster_long_k
                                     temp_v[:, ema_long_start:ema_long_end] = cluster_long_v
                                     temp_k[:, ema_short_start:ema_short_end] = cluster_short_k
@@ -1232,6 +1281,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                                     compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive)
             for _ in range(num_layers)
         ])
+        # Tag each self-attention with its block index (for per-block instrumentation).
+        for _bi, _blk in enumerate(self.blocks):
+            _blk.self_attn.block_index = _bi
         # head
         self.head = CausalHead(dim, out_dim, patch_size, eps)
 

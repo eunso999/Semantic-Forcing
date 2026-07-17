@@ -1,6 +1,7 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: Apache-2.0
 import argparse
+import json
 import os
 
 import peft
@@ -200,6 +201,13 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     else:
         prompts = [prompt] * config.num_samples
 
+    # Optional: log top-1 cluster cosine similarity per (chunk, block, branch).
+    # Enable with env var CLUSTER_SIM_LOG=1 (no effect on the generated video).
+    _sim_log_on = os.environ.get("CLUSTER_SIM_LOG", "0") not in ("0", "", "false", "False")
+    if _sim_log_on:
+        from wan.modules.causal_model import enable_cluster_sim_logging
+        enable_cluster_sim_logging(True)
+
     # Use CPU generator for cross-hardware reproducibility
     generator = torch.Generator(device='cpu').manual_seed(config.seed)
     sampled_noise = torch.randn(
@@ -215,6 +223,17 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         profile=False,
         generator=generator,
     )
+
+    # Dump per-prompt cluster similarity log (if enabled).
+    if _sim_log_on and local_rank == 0:
+        from wan.modules.causal_model import get_cluster_sim_log
+        _sim_records = get_cluster_sim_log() or []
+        _sim_dir = os.path.join(config.output_folder, "cluster_sim")
+        os.makedirs(_sim_dir, exist_ok=True)
+        _sim_path = os.path.join(_sim_dir, f"cluster_sim_{idx:04d}.json")
+        with open(_sim_path, "w") as _f:
+            json.dump(_sim_records, _f)
+        print(f"[cluster_sim] {len(_sim_records)} records -> {_sim_path}")
 
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     video_out = 255.0 * current_video
