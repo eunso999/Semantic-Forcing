@@ -18,6 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch
 import math
+import os
+import numpy as np
 import torch.distributed as dist
 
 
@@ -387,6 +389,101 @@ def _record_key_attend(chunk_idx, block_idx, timestep, roped_q, roped_k, groups)
         else:
             rec[name] = {"sum": 0.0, "mean": 0.0, "min": 0.0, "max": 0.0, "count": 0}
     _KEY_ATTEND_LOG.append(rec)
+
+
+# ---------------------------------------------------------------------------
+# Key-attention MAP instrumentation (analysis v2; separate from v1 above).
+# For a chosen set of chunk indices, this recomputes the FULL query->key
+# attention matrix (head-averaged) on each denoising pass and, per (chunk,
+# block, timestep):
+#   (part 2) renders a query x key heatmap PNG immediately (the full matrix is
+#            far too large to persist for every block/timestep), and
+#   (part 3) saves the per-query, per-slot attention mass [Lq, num_slots] as a
+#            small .npy so it can later be reshaped to (F, H, W, slots) and
+#            overlaid on the decoded RGB frames.
+# Disabled unless _KEY_ATTEND_MAP_DIR is set (via enable_key_attend_map).
+# ---------------------------------------------------------------------------
+_KEY_ATTEND_MAP_DIR = None       # output dir; None disables.
+_KEY_ATTEND_MAP_CHUNKS = set()   # only these autoregressive chunk indices.
+
+
+def enable_key_attend_map(chunks, out_dir):
+    """Enable v2 attention-map logging for the given chunk indices, writing to
+    <out_dir>/heatmap and <out_dir>/spatial. Pass out_dir=None to disable."""
+    global _KEY_ATTEND_MAP_DIR, _KEY_ATTEND_MAP_CHUNKS
+    _KEY_ATTEND_MAP_DIR = out_dir
+    _KEY_ATTEND_MAP_CHUNKS = set(int(c) for c in chunks) if chunks else set()
+    if out_dir is not None:
+        os.makedirs(os.path.join(out_dir, "heatmap"), exist_ok=True)
+        os.makedirs(os.path.join(out_dir, "spatial"), exist_ok=True)
+
+
+def _render_slot_heatmap(pertoken, slot_names, F, frame_seqlen, chunk, block, timestep):
+    """part 2: query(rows) x slot(cols) heatmap of the per-token mean attention
+    weight (slot mass / #tokens in slot). Small and fast to render, and the
+    size-normalized values are comparable across slots (unlike the raw full
+    query x key matrix, where every cell is ~1/kv_len and washes out)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    Lq, S = pertoken.shape
+    fig, ax = plt.subplots(figsize=(1.3 * S + 2.5, 8))
+    im = ax.imshow(pertoken, aspect="auto", cmap="viridis", interpolation="nearest")
+    ax.set_xticks(range(S))
+    ax.set_xticklabels(slot_names, rotation=45, ha="right")
+    # new-frame boundaries along the query axis (frame-major F x H x W).
+    for f in range(1, F):
+        ax.axhline(f * frame_seqlen, color="w", lw=0.6)
+    ax.set_ylabel("query token (frame-major: F x H x W)")
+    ax.set_title(f"per-token mean attn — chunk {chunk}, block {block}, t={timestep}")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="per-token mean attn weight")
+    fig.tight_layout()
+    out = os.path.join(_KEY_ATTEND_MAP_DIR, "heatmap",
+                       f"chunk{chunk:04d}_block{block:02d}_t{timestep:04d}.png")
+    fig.savefig(out, dpi=130)
+    plt.close(fig)
+
+
+def _record_key_attend_map(chunk, block, timestep, roped_q, roped_k, groups,
+                           num_new_frames, frame_seqlen, grid_sizes):
+    """Head-averaged attention aggregated PER SLOT (not the full q x k matrix):
+    emit a part2 query x slot per-token-mean heatmap and a part3 per-slot spatial
+    mass (sum). Only slot sums are accumulated, so no [Lq, Lk] matrix is kept."""
+    if _KEY_ATTEND_MAP_DIR is None:
+        return
+    B, Lq, n, d = roped_q.shape
+    Lk = roped_k.shape[1]
+    H = int(grid_sizes[0][1].item()); W = int(grid_sizes[0][2].item())
+    S = len(groups)
+    bounds = [(max(0, min(int(s), Lk)), max(0, min(int(e), Lk))) for (_, s, e) in groups]
+    counts = torch.tensor([max(1, e - s) for (s, e) in bounds], dtype=torch.float32)
+    qh = roped_q.detach().permute(0, 2, 1, 3).float()   # [B, n, Lq, d]
+    kh = roped_k.detach().permute(0, 2, 1, 3).float()   # [B, n, Lk, d]
+    scale = 1.0 / math.sqrt(d)
+    # Accumulate only per-slot mass [Lq, S] (per head), never the full matrix.
+    slot_sum_acc = torch.zeros(Lq, S, device=qh.device, dtype=torch.float32)
+    for bi in range(B):
+        for hi in range(n):
+            scores = torch.matmul(qh[bi, hi], kh[bi, hi].transpose(0, 1)) * scale
+            probs_h = torch.softmax(scores, dim=-1)     # [Lq, Lk]
+            for si, (s, e) in enumerate(bounds):
+                if e > s:
+                    slot_sum_acc[:, si] += probs_h[:, s:e].sum(dim=1)
+    slot_sum = (slot_sum_acc / float(B * n)).cpu()      # [Lq, S]  total mass per slot
+    slot_names = [g[0] for g in groups]
+
+    # part 2: per-token mean = slot mass / #tokens in slot -> query x slot heatmap.
+    slot_pertoken = (slot_sum / counts).numpy()
+    _render_slot_heatmap(slot_pertoken, slot_names, int(num_new_frames),
+                         int(frame_seqlen), chunk, block, timestep)
+
+    # part 3: per-query slot mass (sum) for the RGB overlay.
+    out = os.path.join(_KEY_ATTEND_MAP_DIR, "spatial",
+                       f"chunk{chunk:04d}_block{block:02d}_t{timestep:04d}.npy")
+    np.save(out, {"slot_mass": slot_sum.numpy().astype(np.float32), "slots": slot_names,
+                  "F": int(num_new_frames), "H": H, "W": W,
+                  "chunk": int(chunk), "block": int(block), "timestep": int(timestep)},
+            allow_pickle=True)
 
 
 def cluster_merge_update(evicted_k, evicted_v, evicted_spatial,
@@ -1095,8 +1192,11 @@ class CausalWanSelfAttention(nn.Module):
                     # clean-context cache-update rerun sets it to None and is
                     # skipped. Only when the full window is attended so the group
                     # indices line up with k_cat.
-                    if (_KEY_ATTEND_LOG is not None and _KEY_ATTEND_TIMESTEP is not None
-                            and local_start_for_window == sink_tokens):
+                    _ka_chunk = int(current_start // frame_seqlen) // max(int(num_new_frames), 1)
+                    _ka_want_v1 = _KEY_ATTEND_LOG is not None and _KEY_ATTEND_TIMESTEP is not None
+                    _ka_want_v2 = (_KEY_ATTEND_MAP_DIR is not None and _KEY_ATTEND_TIMESTEP is not None
+                                   and _ka_chunk in _KEY_ATTEND_MAP_CHUNKS)
+                    if (_ka_want_v1 or _ka_want_v2) and local_start_for_window == sink_tokens:
                         # Whether the cache currently holds mem prototypes. Do NOT
                         # infer this from cache_update_info["action"]: only the first
                         # denoising pass of a chunk takes the ROLLING path
@@ -1127,9 +1227,13 @@ class CausalWanSelfAttention(nn.Module):
                             # Warm-up / no compressed memory yet: [sink | recent | new]
                             _ka_groups += [("recent", sink_tokens, _ka_curr_start)]
                         _ka_groups += [("curr", _ka_curr_start, local_end_index)]
-                        _ka_chunk = int(current_start // frame_seqlen) // max(int(num_new_frames), 1)
-                        _record_key_attend(_ka_chunk, self.block_index, _KEY_ATTEND_TIMESTEP,
-                                           roped_query, k_cat, _ka_groups)
+                        if _ka_want_v1:
+                            _record_key_attend(_ka_chunk, self.block_index, _KEY_ATTEND_TIMESTEP,
+                                               roped_query, k_cat, _ka_groups)
+                        if _ka_want_v2:
+                            _record_key_attend_map(_ka_chunk, self.block_index, _KEY_ATTEND_TIMESTEP,
+                                                   roped_query, k_cat, _ka_groups,
+                                                   num_new_frames, frame_seqlen, grid_sizes)
                 else:
                     k_cat = k_sink
                     v_cat = v_sink
