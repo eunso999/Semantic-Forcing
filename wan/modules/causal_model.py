@@ -294,6 +294,101 @@ def _record_cluster_sim(chunk_idx, block_idx, branch, top1):
     })
 
 
+# ---------------------------------------------------------------------------
+# Key-attribution instrumentation (analysis only).
+# Disabled by default (log is None) so it has ZERO effect on normal runs.
+# When enabled, the self-attention forward recomputes the query->key softmax
+# (the fused attention() kernel does not expose weights) and records, for each
+# (chunk, block), the average attention weight that each key GROUP receives:
+#   sink / mem_long / mem_short / recent / curr(new)
+# The groups partition the whole key window, so their weights sum to ~1.
+# ---------------------------------------------------------------------------
+_KEY_ATTEND_LOG = None  # None disables; a list enables recording.
+# Cap queries used for the (analysis-only) softmax to keep it cheap; the group
+# weights are averaged over queries so a uniform subsample is unbiased.
+_KEY_ATTEND_MAX_QUERIES = 512
+# Current denoising timestep, injected by the generation loop before each pass.
+# None means "do not log this pass" (e.g. the clean-context cache-update rerun).
+_KEY_ATTEND_TIMESTEP = None
+
+
+def enable_key_attend_logging(enabled=True):
+    """Turn per-group attention-weight logging on (fresh list) or off (None)."""
+    global _KEY_ATTEND_LOG
+    _KEY_ATTEND_LOG = [] if enabled else None
+
+
+def get_key_attend_log():
+    """Return the accumulated list of per-call attention-weight records (or None)."""
+    return _KEY_ATTEND_LOG
+
+
+def set_key_attend_timestep(t):
+    """Tag subsequent attention calls with denoising timestep ``t`` (int), or
+    pass None to suppress logging for the upcoming pass (clean-context rerun).
+    Always safe to call; it is a no-op unless logging is enabled."""
+    global _KEY_ATTEND_TIMESTEP
+    _KEY_ATTEND_TIMESTEP = None if t is None else int(t)
+
+
+def _record_key_attend(chunk_idx, block_idx, timestep, roped_q, roped_k, groups):
+    """Recompute q->k softmax and log the mean weight mass per key group.
+
+    Args:
+        roped_q: [B, Lq, n, d] roped query used for this attention call.
+        roped_k: [B, Lk, n, d] roped key actually attended (same tensor passed
+                 to attention()); group indices below are positions within Lk.
+        groups:  list of (name, start, end) half-open ranges over [0, Lk).
+    """
+    if _KEY_ATTEND_LOG is None:
+        return
+    B, Lq, n, d = roped_q.shape
+    Lk = roped_k.shape[1]
+    qh = roped_q.detach().permute(0, 2, 1, 3).float()   # [B, n, Lq, d]
+    kh = roped_k.detach().permute(0, 2, 1, 3).float()   # [B, n, Lk, d]
+
+    # Uniformly subsample queries (weights are averaged over them anyway).
+    if Lq > _KEY_ATTEND_MAX_QUERIES:
+        idx = torch.linspace(0, Lq - 1, _KEY_ATTEND_MAX_QUERIES, device=qh.device).long()
+        qh = qh[:, :, idx, :]
+        Lq_eff = _KEY_ATTEND_MAX_QUERIES
+    else:
+        Lq_eff = Lq
+
+    scale = 1.0 / math.sqrt(d)
+    # Average attention mass each key position receives, over batch/heads/queries.
+    pos_mass = torch.zeros(Lk, device=qh.device, dtype=torch.float32)
+    for bi in range(B):
+        for hi in range(n):
+            scores = torch.matmul(qh[bi, hi], kh[bi, hi].transpose(0, 1)) * scale  # [Lq_eff, Lk]
+            probs = torch.softmax(scores, dim=-1)
+            pos_mass += probs.sum(dim=0)
+    pos_mass /= float(B * n * Lq_eff)
+
+    # pos_mass[j] is the mean attention weight key position j receives (averaged
+    # over batch/heads/queries). For each group we report BOTH:
+    #   sum  = total attention mass to the group (the 5 groups sum to ~1)
+    #   mean = per-token average = sum / (#tokens in group)  [size-normalized]
+    # plus the min/max per-token weight within the group and the token count.
+    rec = {"chunk": int(chunk_idx), "block": int(block_idx),
+           "timestep": int(timestep), "kv_len": int(Lk)}
+    for name, s, e in groups:
+        s = max(0, min(int(s), Lk))
+        e = max(0, min(int(e), Lk))
+        if e > s:
+            seg = pos_mass[s:e]
+            rec[name] = {
+                "sum": float(seg.sum()),
+                "mean": float(seg.mean()),
+                "min": float(seg.min()),
+                "max": float(seg.max()),
+                "count": int(e - s),
+            }
+        else:
+            rec[name] = {"sum": 0.0, "mean": 0.0, "min": 0.0, "max": 0.0, "count": 0}
+    _KEY_ATTEND_LOG.append(rec)
+
+
 def cluster_merge_update(evicted_k, evicted_v, evicted_spatial,
                          proto_k, proto_v, proto_spatial, alpha,
                          sim_log_ctx=None):
@@ -993,6 +1088,48 @@ class CausalWanSelfAttention(nn.Module):
                     v_local = temp_v_active[:, local_start_for_window:local_end_index]
                     k_cat = torch.cat([k_sink, k_local], dim=1)
                     v_cat = torch.cat([v_sink, v_local], dim=1)
+
+                    # Analysis-only: log per-group attention weight (no-op unless
+                    # enabled). Logged on EVERY denoising pass tagged by the
+                    # generation loop (_KEY_ATTEND_TIMESTEP is not None); the
+                    # clean-context cache-update rerun sets it to None and is
+                    # skipped. Only when the full window is attended so the group
+                    # indices line up with k_cat.
+                    if (_KEY_ATTEND_LOG is not None and _KEY_ATTEND_TIMESTEP is not None
+                            and local_start_for_window == sink_tokens):
+                        # Whether the cache currently holds mem prototypes. Do NOT
+                        # infer this from cache_update_info["action"]: only the first
+                        # denoising pass of a chunk takes the ROLLING path
+                        # (action="ema"); the recompute passes (t=750/500/250) take
+                        # the DIRECT-INSERT path (action="direct_insert") even though
+                        # the cache still holds the same mem frames. Use action=="ema"
+                        # (mem just (re)built this pass) OR ema_initialized (mem built
+                        # in an earlier chunk and still resident).
+                        _ka_action = cache_update_info.get("action") if cache_update_info else None
+                        _ka_ema_init = ("ema_initialized" in kv_cache) and kv_cache["ema_initialized"]
+                        _ka_has_mem = (
+                            self.compression_method in ('ema', 'cluster')
+                            and local_end_index >= sink_tokens + 2 * frame_seqlen
+                            and ((_ka_action == "ema") or _ka_ema_init)
+                        )
+                        _ka_curr_start = local_end_index - num_new_tokens
+                        _ka_groups = [("sink", 0, sink_tokens)]
+                        if _ka_has_mem:
+                            # Layout: [sink | mem_long 1f | mem_short 1f | recent | new]
+                            _ka_ml_end = sink_tokens + frame_seqlen
+                            _ka_ms_end = _ka_ml_end + frame_seqlen
+                            _ka_groups += [
+                                ("mem_long", sink_tokens, _ka_ml_end),
+                                ("mem_short", _ka_ml_end, _ka_ms_end),
+                                ("recent", _ka_ms_end, _ka_curr_start),
+                            ]
+                        else:
+                            # Warm-up / no compressed memory yet: [sink | recent | new]
+                            _ka_groups += [("recent", sink_tokens, _ka_curr_start)]
+                        _ka_groups += [("curr", _ka_curr_start, local_end_index)]
+                        _ka_chunk = int(current_start // frame_seqlen) // max(int(num_new_frames), 1)
+                        _record_key_attend(_ka_chunk, self.block_index, _KEY_ATTEND_TIMESTEP,
+                                           roped_query, k_cat, _ka_groups)
                 else:
                     k_cat = k_sink
                     v_cat = v_sink

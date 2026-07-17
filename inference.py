@@ -208,6 +208,13 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         from wan.modules.causal_model import enable_cluster_sim_logging
         enable_cluster_sim_logging(True)
 
+    # Optional: log per-group (sink/mem/recent/curr) average attention weight per
+    # (chunk, block). Enable with env var KEY_ATTEND_LOG=1 (no effect on video).
+    _ka_log_on = os.environ.get("KEY_ATTEND_LOG", "0") not in ("0", "", "false", "False")
+    if _ka_log_on:
+        from wan.modules.causal_model import enable_key_attend_logging
+        enable_key_attend_logging(True)
+
     # Use CPU generator for cross-hardware reproducibility
     generator = torch.Generator(device='cpu').manual_seed(config.seed)
     sampled_noise = torch.randn(
@@ -234,6 +241,17 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         with open(_sim_path, "w") as _f:
             json.dump(_sim_records, _f)
         print(f"[cluster_sim] {len(_sim_records)} records -> {_sim_path}")
+
+    # Dump per-prompt key-attribution log (if enabled).
+    if _ka_log_on and local_rank == 0:
+        from wan.modules.causal_model import get_key_attend_log
+        _ka_records = get_key_attend_log() or []
+        _ka_dir = os.path.join(config.output_folder, "key_attend")
+        os.makedirs(_ka_dir, exist_ok=True)
+        _ka_path = os.path.join(_ka_dir, f"key_attend_{idx:04d}.json")
+        with open(_ka_path, "w") as _f:
+            json.dump(_ka_records, _f)
+        print(f"[key_attend] {len(_ka_records)} records -> {_ka_path}")
 
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     video_out = 255.0 * current_video

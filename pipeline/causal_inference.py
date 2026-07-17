@@ -6,6 +6,7 @@ import torch
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
+from wan.modules.causal_model import set_key_attend_timestep
 import torch.distributed as dist
 
 class CausalInferencePipeline(torch.nn.Module):
@@ -151,6 +152,9 @@ class CausalInferencePipeline(torch.nn.Module):
 
             # Step 2.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
+                # Tag key-attend logging with this denoising timestep (no-op
+                # unless KEY_ATTEND_LOG is enabled).
+                set_key_attend_timestep(int(current_timestep))
                 # set current timestep
                 timestep = torch.ones(
                     [batch_size, current_num_frames],
@@ -193,7 +197,10 @@ class CausalInferencePipeline(torch.nn.Module):
                     )
             # Step 2.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)
-            # Step 2.3: rerun with timestep zero to update KV cache using clean context
+            # Step 2.3: rerun with timestep zero to update KV cache using clean context.
+            # Suppress key-attend logging for this clean-context pass (not a
+            # denoising timestep we plot).
+            set_key_attend_timestep(None)
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
             self.generator(
                 noisy_image_or_video=denoised_pred,
