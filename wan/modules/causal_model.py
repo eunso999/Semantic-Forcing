@@ -486,6 +486,101 @@ def _record_key_attend_map(chunk, block, timestep, roped_q, roped_k, groups,
             allow_pickle=True)
 
 
+# ---------------------------------------------------------------------------
+# Memory-similarity MAP instrumentation (analysis exp4; separate from v2 above).
+# During the CLEAN-context pass, for chosen chunk indices, record per new token
+# the top-1 cosine similarity to the shadow long/short memory prototypes, for
+# both key and value spaces -> 4 slots. Saved with the same [Lq, S] spatial
+# schema as _record_key_attend_map so analysis/plot_key_attend_map.py is reused.
+# Disabled unless _MEM_SIM_MAP_DIR is set. No effect on generation.
+# ---------------------------------------------------------------------------
+_MEM_SIM_MAP_DIR = None
+_MEM_SIM_MAP_CHUNKS = set()
+_MEM_SIM_SLOTS = ["key_long", "key_short", "value_long", "value_short"]
+
+
+def enable_mem_sim_map(chunks, out_dir):
+    """Enable exp4 memory-cos-sim logging for the given chunk indices."""
+    global _MEM_SIM_MAP_DIR, _MEM_SIM_MAP_CHUNKS
+    _MEM_SIM_MAP_DIR = out_dir
+    _MEM_SIM_MAP_CHUNKS = set(int(c) for c in chunks) if chunks else set()
+    if out_dir is not None:
+        os.makedirs(os.path.join(out_dir, "spatial"), exist_ok=True)
+
+
+def _top1_cossim(new_x, proto_x):
+    """new_x: [B, Lq, n, d], proto_x: [B, M, n, d] -> [Lq] top-1 cos-sim (batch 0),
+    over flattened heads (same space as cluster_merge_update)."""
+    B, Lq = new_x.shape[0], new_x.shape[1]
+    M = proto_x.shape[1]
+    e = F.normalize(new_x.reshape(B, Lq, -1).float(), dim=-1)
+    p = F.normalize(proto_x.reshape(B, M, -1).float(), dim=-1)
+    sim = torch.matmul(e, p.transpose(1, 2))          # [B, Lq, M]
+    return sim.max(dim=-1).values[0].detach().cpu()   # [Lq]
+
+
+def _record_mem_sim_map(chunk, block, k_new, v_new,
+                        smem_long_k, smem_long_v, smem_short_k, smem_short_v,
+                        num_new_frames, frame_seqlen, grid_sizes):
+    """Save per-new-token top-1 cos-sim to shadow memory: 4 slots
+    {key,value}x{long,short}, [Lq, 4], reusing the key_attend_map .npy schema."""
+    if _MEM_SIM_MAP_DIR is None:
+        return
+    H = int(grid_sizes[0][1].item()); W = int(grid_sizes[0][2].item())
+    cols = [
+        _top1_cossim(k_new, smem_long_k),
+        _top1_cossim(k_new, smem_short_k),
+        _top1_cossim(v_new, smem_long_v),
+        _top1_cossim(v_new, smem_short_v),
+    ]
+    slot_mass = torch.stack(cols, dim=1).numpy().astype(np.float32)   # [Lq, 4]
+    out = os.path.join(_MEM_SIM_MAP_DIR, "spatial",
+                       f"chunk{chunk:04d}_block{block:02d}_t0000.npy")
+    np.save(out, {"slot_mass": slot_mass, "slots": list(_MEM_SIM_SLOTS),
+                  "F": int(num_new_frames), "H": H, "W": W,
+                  "chunk": int(chunk), "block": int(block), "timestep": 0},
+            allow_pickle=True)
+
+
+def _refine_value_with_memory(k_new, v_new, proto_k, proto_v,
+                              gate_mode="matched", tau=0.6, beta=0.1, alpha=1.0):
+    """exp5: refine new (clean recent) VALUE tokens toward memory (long prototypes).
+
+    For each new token: match by KEY cos-sim to the top-1 prototype (j*), fetch
+    that prototype's VALUE, and convex-blend it into the new value with a soft
+    gate g that is LARGE where the new value poorly matches memory (low value
+    cos-sim = likely artifact) and ~0 where it matches well.
+
+      v_refined = (1 - g) * v_new + g * proto_v[j*],   g = alpha * sigmoid((tau - vsim)/beta)
+
+    gate_mode:
+      "matched" : vsim = cos-sim(v_new, proto_v[j*])              (key-matched prototype's value)
+      "top1"    : vsim = max_j cos-sim(v_new, proto_v[j])         (best value match, key-independent)
+
+    k_new,v_new: [B, Lq, n, d] (un-roped); proto_k,proto_v: [B, M, n, d]. Key is
+    NOT modified (only the value is refined). Returns [B, Lq, n, d] in v_new.dtype.
+    """
+    B, Lq, n, d = k_new.shape
+    M = proto_k.shape[1]
+    kf = F.normalize(k_new.reshape(B, Lq, n * d).float(), dim=-1)
+    pkf = F.normalize(proto_k.reshape(B, M, n * d).float(), dim=-1)
+    jstar = torch.matmul(kf, pkf.transpose(1, 2)).argmax(dim=-1)        # [B, Lq] key top-1
+    idx = jstar[:, :, None, None].expand(-1, -1, n, d)                  # [B, Lq, n, d]
+    pv_match = torch.gather(proto_v, 1, idx)                           # [B, Lq, n, d]
+
+    vf = F.normalize(v_new.reshape(B, Lq, n * d).float(), dim=-1)
+    if gate_mode == "top1":
+        pvf = F.normalize(proto_v.reshape(B, M, n * d).float(), dim=-1)
+        vsim = torch.matmul(vf, pvf.transpose(1, 2)).max(dim=-1).values  # [B, Lq]
+    else:  # "matched"
+        pvm = F.normalize(pv_match.reshape(B, Lq, n * d).float(), dim=-1)
+        vsim = (vf * pvm).sum(dim=-1)                                    # [B, Lq]
+
+    g = (alpha * torch.sigmoid((tau - vsim) / beta))                    # [B, Lq], low vsim -> high g
+    g = g[:, :, None, None].to(v_new.dtype)
+    return (1.0 - g) * v_new + g * pv_match.to(v_new.dtype)
+
+
 def cluster_merge_update(evicted_k, evicted_v, evicted_spatial,
                          proto_k, proto_v, proto_spatial, alpha,
                          sim_log_ctx=None,
@@ -624,7 +719,13 @@ class CausalWanSelfAttention(nn.Module):
                  ema_alpha_short=0.1,
                  ema_adaptive=False,
                  mem_logn_bias=False,
-                 mem_key_renorm=False):
+                 mem_key_renorm=False,
+                 mem_side_buffer=False,
+                 mem_value_refine=False,
+                 mem_value_refine_gate="matched",
+                 mem_value_refine_tau=0.6,
+                 mem_value_refine_beta=0.1,
+                 mem_value_refine_alpha=1.0):
         """
         Args:
             sink_size: number of sink frames to preserve at the beginning
@@ -656,6 +757,19 @@ class CausalWanSelfAttention(nn.Module):
         # exp3 memory-attention corrections (both default off => identical to prior behavior)
         self.mem_logn_bias = mem_logn_bias
         self.mem_key_renorm = mem_key_renorm
+        # exp4 shadow memory buffer (default off => identical to prior behavior).
+        # When on: maintain long/short cluster prototypes in a side buffer (never
+        # attended) for the clean-pass cos-sim overlay analysis.
+        self.mem_side_buffer = mem_side_buffer
+        # exp5 value refinement (default off => identical to prior behavior). When
+        # on (requires eviction + mem_side_buffer): at the clean pass, refine the
+        # new clean recent VALUE tokens toward their key-matched long prototype's
+        # value via a soft-gated convex blend, before they are stored to the cache.
+        self.mem_value_refine = mem_value_refine
+        self.mem_value_refine_gate = mem_value_refine_gate
+        self.mem_value_refine_tau = mem_value_refine_tau
+        self.mem_value_refine_beta = mem_value_refine_beta
+        self.mem_value_refine_alpha = mem_value_refine_alpha
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
         if not isinstance(local_attn_size, int) and hasattr(local_attn_size, "__iter__"):
             values = list(local_attn_size)
@@ -803,6 +917,37 @@ class CausalWanSelfAttention(nn.Module):
             # Compute cache update parameters without modifying kv_cache directly
             cache_update_info = None
             is_recompute = current_end <= kv_cache["global_end_index"].item() and current_start > 0
+
+            # exp4: on the CLEAN-context pass (_KEY_ATTEND_TIMESTEP is None) log the
+            # top-1 cos-sim of this chunk's new clean K/V to the shadow long/short
+            # prototypes. No-op unless mem_side_buffer + MEM_SIM_MAP are enabled and
+            # the shadow memory has been seeded (so no effect on default runs).
+            if (_MEM_SIM_MAP_DIR is not None and _KEY_ATTEND_TIMESTEP is None
+                    and self.mem_side_buffer and kv_cache.get("smem_init", False)):
+                _ms_chunk = int(current_start // frame_seqlen) // max(int(num_new_frames), 1)
+                if _ms_chunk in _MEM_SIM_MAP_CHUNKS:
+                    _record_mem_sim_map(
+                        _ms_chunk, self.block_index, k, v,
+                        kv_cache["smem_long_k"], kv_cache["smem_long_v"],
+                        kv_cache["smem_short_k"], kv_cache["smem_short_v"],
+                        num_new_frames, frame_seqlen, grid_sizes)
+
+            # exp5: refine the new clean recent VALUE tokens toward the long memory
+            # prototypes (key-matched, soft-gated convex blend) BEFORE they are
+            # written to the cache. Clean pass only (_KEY_ATTEND_TIMESTEP is None)
+            # so denoising-pass values (and the current frame's output) are unchanged;
+            # the refined value becomes recent for future chunks. Key stays original.
+            # No-op unless the flag is on and shadow memory is initialized.
+            if (self.mem_value_refine and _KEY_ATTEND_TIMESTEP is None
+                    and self.compression_method == 'eviction'
+                    and kv_cache.get("smem_init", False)):
+                v = _refine_value_with_memory(
+                    k, v, kv_cache["smem_long_k"], kv_cache["smem_long_v"],
+                    gate_mode=self.mem_value_refine_gate,
+                    tau=self.mem_value_refine_tau,
+                    beta=self.mem_value_refine_beta,
+                    alpha=self.mem_value_refine_alpha)
+
             # exp3: freshly-computed per-prototype count/knorm for this pass (set only
             # in the rolling cluster branch); None everywhere else. Declared here so
             # the shared attention block below can read them regardless of branch.
@@ -1145,6 +1290,41 @@ class CausalWanSelfAttention(nn.Module):
                     # === SIMPLE EVICTION (FIFO) ===
                     num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
 
+                    # exp4 shadow memory: BEFORE the FIFO roll overwrites them, take the
+                    # oldest recent tokens being evicted and fold them into the side
+                    # long/short cluster prototypes (same cluster_merge_update algorithm;
+                    # never attended). Only on the first pass (not is_recompute) so it
+                    # updates once per chunk, mirroring cluster mode. No-op unless the
+                    # flag is on -> identical to prior eviction behavior otherwise.
+                    smem_long_k_new = smem_long_v_new = None
+                    smem_short_k_new = smem_short_v_new = None
+                    smem_sp_long_new = smem_sp_short_new = None
+                    smem_init_new = None
+                    if self.mem_side_buffer and not is_recompute and num_evicted_tokens > 0:
+                        ev_k = kv_cache["k"][:, sink_tokens:sink_tokens + num_evicted_tokens]
+                        ev_v = kv_cache["v"][:, sink_tokens:sink_tokens + num_evicted_tokens]
+                        if not kv_cache.get("smem_init", False):
+                            # Seed prototypes from the first recent frame (identity spatial),
+                            # mirroring cluster init.
+                            seed_k = kv_cache["k"][:, sink_tokens:sink_tokens + frame_seqlen].clone()
+                            seed_v = kv_cache["v"][:, sink_tokens:sink_tokens + frame_seqlen].clone()
+                            smem_long_k_new, smem_long_v_new = seed_k, seed_v
+                            smem_short_k_new, smem_short_v_new = seed_k.clone(), seed_v.clone()
+                            _init_sp = torch.arange(frame_seqlen, device=k.device, dtype=torch.float32).unsqueeze(0).expand(b, -1).clone()
+                            smem_sp_long_new = _init_sp
+                            smem_sp_short_new = _init_sp.clone()
+                            smem_init_new = True
+                        else:
+                            ev_spatial = (torch.arange(num_evicted_tokens, device=k.device) % frame_seqlen).unsqueeze(0).expand(b, -1)
+                            smem_long_k_new, smem_long_v_new, smem_sp_long_new, _, _ = cluster_merge_update(
+                                ev_k, ev_v, ev_spatial,
+                                kv_cache["smem_long_k"], kv_cache["smem_long_v"], kv_cache["smem_spatial_long"],
+                                self.ema_alpha_long)
+                            smem_short_k_new, smem_short_v_new, smem_sp_short_new, _, _ = cluster_merge_update(
+                                ev_k, ev_v, ev_spatial,
+                                kv_cache["smem_short_k"], kv_cache["smem_short_v"], kv_cache["smem_spatial_short"],
+                                self.ema_alpha_short)
+
                     # Compute updated local indices
                     local_end_index = kv_cache["local_end_index"].item() + current_end - \
                         kv_cache["global_end_index"].item() - num_evicted_tokens
@@ -1208,7 +1388,12 @@ class CausalWanSelfAttention(nn.Module):
                         "new_temporal_indices": new_temporal_indices,  # [write_len]
                         "new_spatial_indices": new_spatial_indices,    # [write_len]
                         "current_end": current_end,
-                        "is_recompute": is_recompute
+                        "is_recompute": is_recompute,
+                        # exp4 shadow memory (None unless mem_side_buffer on -> not written)
+                        "smem_long_k": smem_long_k_new, "smem_long_v": smem_long_v_new,
+                        "smem_short_k": smem_short_k_new, "smem_short_v": smem_short_v_new,
+                        "smem_spatial_long": smem_sp_long_new, "smem_spatial_short": smem_sp_short_new,
+                        "smem_init": smem_init_new,
                     }
             else:
                 # === DIRECT INSERT MODE ===
@@ -1419,7 +1604,13 @@ class CausalWanAttentionBlock(nn.Module):
                  ema_alpha_short=0.1,
                  ema_adaptive=False,
                  mem_logn_bias=False,
-                 mem_key_renorm=False):
+                 mem_key_renorm=False,
+                 mem_side_buffer=False,
+                 mem_value_refine=False,
+                 mem_value_refine_gate="matched",
+                 mem_value_refine_tau=0.6,
+                 mem_value_refine_beta=0.1,
+                 mem_value_refine_alpha=1.0):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -1431,7 +1622,7 @@ class CausalWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, recent_size, qk_norm, eps, use_block_rope, compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive, mem_logn_bias, mem_key_renorm)
+        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, recent_size, qk_norm, eps, use_block_rope, compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive, mem_logn_bias, mem_key_renorm, mem_side_buffer, mem_value_refine, mem_value_refine_gate, mem_value_refine_tau, mem_value_refine_beta, mem_value_refine_alpha)
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -1581,7 +1772,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  ema_alpha_short=0.1,
                  ema_adaptive=False,
                  mem_logn_bias=False,
-                 mem_key_renorm=False):
+                 mem_key_renorm=False,
+                 mem_side_buffer=False,
+                 mem_value_refine=False,
+                 mem_value_refine_gate="matched",
+                 mem_value_refine_tau=0.6,
+                 mem_value_refine_beta=0.1,
+                 mem_value_refine_alpha=1.0):
         r"""
         Initialize the diffusion model backbone.
 
@@ -1659,7 +1856,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
                                     local_attn_size, sink_size, recent_size, qk_norm, cross_attn_norm, eps, use_block_rope,
                                     compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive,
-                                    mem_logn_bias, mem_key_renorm)
+                                    mem_logn_bias, mem_key_renorm, mem_side_buffer,
+                                    mem_value_refine, mem_value_refine_gate, mem_value_refine_tau,
+                                    mem_value_refine_beta, mem_value_refine_alpha)
             for _ in range(num_layers)
         ])
         # Tag each self-attention with its block index (for per-block instrumentation).
@@ -1867,7 +2066,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                             cache["token_temporal_indices"][:, write_start_index:write_end_index] = new_temporal_indices
                         if new_spatial_indices is not None and "token_spatial_indices" in cache:
                             cache["token_spatial_indices"][:, write_start_index:write_end_index] = new_spatial_indices
-                    
+
+                    # exp4 shadow memory: persist updated side prototypes (only when
+                    # mem_side_buffer produced them this pass; None on recompute/off).
+                    if update_info.get("smem_long_k") is not None:
+                        cache["smem_long_k"] = update_info["smem_long_k"]
+                        cache["smem_long_v"] = update_info["smem_long_v"]
+                        cache["smem_short_k"] = update_info["smem_short_k"]
+                        cache["smem_short_v"] = update_info["smem_short_v"]
+                        cache["smem_spatial_long"] = update_info["smem_spatial_long"]
+                        cache["smem_spatial_short"] = update_info["smem_spatial_short"]
+                        if update_info.get("smem_init"):
+                            cache["smem_init"] = True
 
                 elif update_info["action"] == "ema":
                     # EMA: [Sink] + [Long-term EMA] + [Short-term EMA] + [Recent] + [New]

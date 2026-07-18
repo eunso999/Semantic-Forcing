@@ -227,6 +227,18 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         from wan.modules.causal_model import enable_key_attend_map
         enable_key_attend_map(_kamap_chunks, _kamap_dir)
 
+    # Optional (exp4): for the chunk indices in MEM_SIM_MAP, log the clean-pass
+    # top-1 cos-sim of new tokens' clean K/V to the shadow long/short memory
+    # prototypes (4 slots) for the overlay. Requires model_kwargs.mem_side_buffer=True.
+    _msmap_env = os.environ.get("MEM_SIM_MAP", "").strip()
+    _msmap_on = _msmap_env not in ("", "0", "false", "False")
+    _msmap_chunks, _msmap_dir = [], None
+    if _msmap_on:
+        _msmap_chunks = [int(x) for x in _msmap_env.replace(" ", "").split(",") if x != ""]
+        _msmap_dir = os.path.join(config.output_folder, "mem_sim_map", f"sample_{idx:04d}")
+        from wan.modules.causal_model import enable_mem_sim_map
+        enable_mem_sim_map(_msmap_chunks, _msmap_dir)
+
     # Use CPU generator for cross-hardware reproducibility
     generator = torch.Generator(device='cpu').manual_seed(config.seed)
     sampled_noise = torch.randn(
@@ -268,23 +280,27 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     video_out = 255.0 * current_video
 
-    # Save one representative decoded RGB frame per analyzed chunk (v2 overlay).
-    if _kamap_on and local_rank == 0 and _kamap_dir is not None:
-        import numpy as _np
+    # Save one representative decoded RGB frame per analyzed chunk (overlay bg).
+    def _dump_chunk_frames(_dir, _chunks, _tag):
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as _plt
-        _frames_dir = os.path.join(_kamap_dir, "frames")
+        _frames_dir = os.path.join(_dir, "frames")
         os.makedirs(_frames_dir, exist_ok=True)
         _vid = video_out[0].clamp(0, 255).to(torch.uint8).numpy()  # [t_pixel, h, w, c]
         _tpix = _vid.shape[0]
         _nfpb = int(getattr(config, "num_frame_per_block", 3))
         _nlat = int(config.num_output_frames)
-        for _c in _kamap_chunks:
+        for _c in _chunks:
             # Map chunk -> its first latent frame -> approx decoded pixel frame.
             _pix = min(int(round((_c * _nfpb) / max(_nlat, 1) * _tpix)), _tpix - 1)
             _plt.imsave(os.path.join(_frames_dir, f"chunk{_c:04d}.png"), _vid[_pix])
-        print(f"[key_attend_map] {len(_kamap_chunks)} chunk frames -> {_frames_dir}")
+        print(f"[{_tag}] {len(_chunks)} chunk frames -> {_frames_dir}")
+
+    if _kamap_on and local_rank == 0 and _kamap_dir is not None:
+        _dump_chunk_frames(_kamap_dir, _kamap_chunks, "key_attend_map")
+    if _msmap_on and local_rank == 0 and _msmap_dir is not None:
+        _dump_chunk_frames(_msmap_dir, _msmap_chunks, "mem_sim_map")
 
     # Clear VAE cache
     pipeline.vae.model.clear_cache()

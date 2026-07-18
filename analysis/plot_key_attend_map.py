@@ -114,7 +114,13 @@ def render_slot_overlay(chunks_data, slot, frames, out_png, title, cmap, alpha_g
             ax.set_title(f"chunk {c} (no {slot})", fontsize=8)
         ax.axis("off")
     fig.suptitle(title, fontsize=11)
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    # Reserve room on the right for a shared colorbar showing the [vmin, vmax]
+    # range that the overlay color intensity was normalized to (per slot/figure).
+    fig.tight_layout(rect=[0, 0, 0.93, 0.94])
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    sm.set_array([])
+    cax = fig.add_axes([0.945, 0.12, 0.015, 0.72])   # [left, bottom, width, height]
+    fig.colorbar(sm, cax=cax, label="cos-sim")
     fig.savefig(out_png, dpi=130)
     plt.close(fig)
     return True

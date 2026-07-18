@@ -289,6 +289,10 @@ class CausalInferencePipeline(torch.nn.Module):
         # Support per-block device allocation for multi-GPU pipeline parallelism
         block_devices = getattr(self, 'block_devices', None)
 
+        # exp4: allocate shadow-memory side buffers only when mem_side_buffer is on
+        # (default off => nothing extra allocated, identical to prior behavior).
+        _mem_side_buffer = bool(getattr(self.args.model_kwargs, "mem_side_buffer", False))
+
         for block_idx in range(self.num_transformer_blocks):
             blk_device = block_devices[block_idx] if block_devices is not None else device
             kv_cache1.append({
@@ -316,6 +320,19 @@ class CausalInferencePipeline(torch.nn.Module):
                 "selected_token_indices": None,
                 "original_spatial_indices": None
             })
+            # exp4: shadow long/short cluster memory prototypes (never attended;
+            # maintained from eviction's evicted tokens for the cos-sim overlay).
+            if _mem_side_buffer:
+                M = self.frame_seq_length
+                kv_cache1[-1].update({
+                    "smem_long_k": torch.zeros([batch_size, M, 12, 128], dtype=dtype, device=blk_device),
+                    "smem_long_v": torch.zeros([batch_size, M, 12, 128], dtype=dtype, device=blk_device),
+                    "smem_short_k": torch.zeros([batch_size, M, 12, 128], dtype=dtype, device=blk_device),
+                    "smem_short_v": torch.zeros([batch_size, M, 12, 128], dtype=dtype, device=blk_device),
+                    "smem_spatial_long": torch.arange(M, dtype=torch.float32, device=blk_device).unsqueeze(0).expand(batch_size, -1).clone(),
+                    "smem_spatial_short": torch.arange(M, dtype=torch.float32, device=blk_device).unsqueeze(0).expand(batch_size, -1).clone(),
+                    "smem_init": False,
+                })
 
         self.kv_cache1 = kv_cache1  # always store the clean cache
 
