@@ -36,6 +36,13 @@ model_kwargs:
   mem_value_refine_tau: 0.6
   mem_value_refine_beta: 0.1
   mem_value_refine_alpha: 1.0
+  # gate_fn: "sigmoid" g=alpha*sigmoid((tau-vsim)/beta) | "relu" g=alpha*clamp((tau-vsim)/tau,0)
+  mem_value_refine_gate_fn: sigmoid
+  # which transformer blocks to refine: "all" | "10,11,12" | "10-20" | "0,5,10-12"
+  mem_value_refine_blocks: all
+  # after blending, rescale each head-vector back to the original v_new norm
+  # (blend shrinks norm -> blur; restoring magnitude keeps energy). true|false
+  mem_value_refine_norm_restore: true
 
 # Inference
 data_path: prompts/moviegenbench_128_refined.txt

@@ -542,8 +542,31 @@ def _record_mem_sim_map(chunk, block, k_new, v_new,
             allow_pickle=True)
 
 
+def _parse_block_spec(spec):
+    """Parse a block-index spec into a set of ints, or None meaning 'all blocks'.
+    Accepts: None / "" / "all" -> None; "10,11,12" -> {10,11,12};
+    "10-20" -> {10..20}; mixed "0,5,10-12" supported."""
+    if spec is None:
+        return None
+    s = str(spec).strip().lower()
+    if s in ("", "all", "-1"):
+        return None
+    out = set()
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, bb = part.split("-", 1)
+            out.update(range(int(a), int(bb) + 1))
+        else:
+            out.add(int(part))
+    return out if out else None
+
+
 def _refine_value_with_memory(k_new, v_new, proto_k, proto_v,
-                              gate_mode="matched", tau=0.6, beta=0.1, alpha=1.0):
+                              gate_mode="matched", tau=0.6, beta=0.1, alpha=1.0,
+                              gate_fn="sigmoid", norm_restore=True):
     """exp5: refine new (clean recent) VALUE tokens toward memory (long prototypes).
 
     For each new token: match by KEY cos-sim to the top-1 prototype (j*), fetch
@@ -551,11 +574,21 @@ def _refine_value_with_memory(k_new, v_new, proto_k, proto_v,
     gate g that is LARGE where the new value poorly matches memory (low value
     cos-sim = likely artifact) and ~0 where it matches well.
 
-      v_refined = (1 - g) * v_new + g * proto_v[j*],   g = alpha * sigmoid((tau - vsim)/beta)
+      v_refined = (1 - g) * v_new + g * proto_v[j*]
 
-    gate_mode:
+    gate_mode (which value cos-sim vsim to gate on):
       "matched" : vsim = cos-sim(v_new, proto_v[j*])              (key-matched prototype's value)
       "top1"    : vsim = max_j cos-sim(v_new, proto_v[j])         (best value match, key-independent)
+
+    gate_fn (how vsim maps to the blend weight g; low vsim -> larger g):
+      "sigmoid" : g = alpha * sigmoid((tau - vsim) / beta)        (smooth; beta = temperature)
+      "relu"    : g = alpha * clamp((tau - vsim) / tau, min=0)    (piecewise-linear; exactly 0 at vsim >= tau)
+
+    norm_restore: if True, after blending, rescale each head-vector back to the
+      ORIGINAL v_new head-norm. The convex blend shrinks the norm (mixing two
+      directions) which blurs the value; restoring the magnitude keeps the
+      memory-guided direction while preserving the original energy. No-op where
+      g==0 (unrefined tokens are returned exactly).
 
     k_new,v_new: [B, Lq, n, d] (un-roped); proto_k,proto_v: [B, M, n, d]. Key is
     NOT modified (only the value is refined). Returns [B, Lq, n, d] in v_new.dtype.
@@ -576,9 +609,20 @@ def _refine_value_with_memory(k_new, v_new, proto_k, proto_v,
         pvm = F.normalize(pv_match.reshape(B, Lq, n * d).float(), dim=-1)
         vsim = (vf * pvm).sum(dim=-1)                                    # [B, Lq]
 
-    g = (alpha * torch.sigmoid((tau - vsim) / beta))                    # [B, Lq], low vsim -> high g
+    if gate_fn == "relu":
+        # piecewise-linear soft threshold; exactly 0 once vsim >= tau.
+        g = alpha * torch.clamp((tau - vsim) / tau, min=0.0)             # [B, Lq]
+    else:  # "sigmoid"
+        g = alpha * torch.sigmoid((tau - vsim) / beta)                  # [B, Lq], low vsim -> high g
     g = g[:, :, None, None].to(v_new.dtype)
-    return (1.0 - g) * v_new + g * pv_match.to(v_new.dtype)
+    v_hat = (1.0 - g) * v_new + g * pv_match.to(v_new.dtype)
+    if norm_restore:
+        # Restore each head-vector's original magnitude (blend keeps direction,
+        # not energy). Computed in float32 for stability. No-op where g==0.
+        num = v_new.float().norm(dim=-1, keepdim=True)                    # [B, Lq, n, 1]
+        den = v_hat.float().norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        v_hat = (v_hat.float() * (num / den)).to(v_new.dtype)
+    return v_hat
 
 
 def cluster_merge_update(evicted_k, evicted_v, evicted_spatial,
@@ -725,7 +769,10 @@ class CausalWanSelfAttention(nn.Module):
                  mem_value_refine_gate="matched",
                  mem_value_refine_tau=0.6,
                  mem_value_refine_beta=0.1,
-                 mem_value_refine_alpha=1.0):
+                 mem_value_refine_alpha=1.0,
+                 mem_value_refine_gate_fn="sigmoid",
+                 mem_value_refine_blocks="all",
+                 mem_value_refine_norm_restore=True):
         """
         Args:
             sink_size: number of sink frames to preserve at the beginning
@@ -770,6 +817,10 @@ class CausalWanSelfAttention(nn.Module):
         self.mem_value_refine_tau = mem_value_refine_tau
         self.mem_value_refine_beta = mem_value_refine_beta
         self.mem_value_refine_alpha = mem_value_refine_alpha
+        self.mem_value_refine_gate_fn = mem_value_refine_gate_fn
+        # None => all blocks; else a set of block indices where refine is applied.
+        self.mem_value_refine_blocks = _parse_block_spec(mem_value_refine_blocks)
+        self.mem_value_refine_norm_restore = mem_value_refine_norm_restore
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
         if not isinstance(local_attn_size, int) and hasattr(local_attn_size, "__iter__"):
             values = list(local_attn_size)
@@ -944,13 +995,17 @@ class CausalWanSelfAttention(nn.Module):
             v_refined_for_cache = None
             if (self.mem_value_refine and _KEY_ATTEND_TIMESTEP is None
                     and self.compression_method == 'eviction'
-                    and kv_cache.get("smem_init", False)):
+                    and kv_cache.get("smem_init", False)
+                    and (self.mem_value_refine_blocks is None
+                         or self.block_index in self.mem_value_refine_blocks)):
                 v_refined_for_cache = _refine_value_with_memory(
                     k, v, kv_cache["smem_long_k"], kv_cache["smem_long_v"],
                     gate_mode=self.mem_value_refine_gate,
                     tau=self.mem_value_refine_tau,
                     beta=self.mem_value_refine_beta,
-                    alpha=self.mem_value_refine_alpha)
+                    alpha=self.mem_value_refine_alpha,
+                    gate_fn=self.mem_value_refine_gate_fn,
+                    norm_restore=self.mem_value_refine_norm_restore)
 
             # exp3: freshly-computed per-prototype count/knorm for this pass (set only
             # in the rolling cluster branch); None everywhere else. Declared here so
@@ -1306,12 +1361,16 @@ class CausalWanSelfAttention(nn.Module):
                     smem_init_new = None
                     if self.mem_side_buffer and not is_recompute and num_evicted_tokens > 0:
                         ev_k = kv_cache["k"][:, sink_tokens:sink_tokens + num_evicted_tokens]
-                        ev_v = kv_cache["v"][:, sink_tokens:sink_tokens + num_evicted_tokens]
+                        # exp5(B): evict VALUE source = smem_src_v (ORIGINAL, pre-refine)
+                        # so shadow memory tracks original content, not refined cache["v"].
+                        # (Key never refined -> cache["k"] is already original.)
+                        _ev_src_v = kv_cache["smem_src_v"] if "smem_src_v" in kv_cache else kv_cache["v"]
+                        ev_v = _ev_src_v[:, sink_tokens:sink_tokens + num_evicted_tokens]
                         if not kv_cache.get("smem_init", False):
                             # Seed prototypes from the first recent frame (identity spatial),
-                            # mirroring cluster init.
+                            # mirroring cluster init. Value seed also from the original source.
                             seed_k = kv_cache["k"][:, sink_tokens:sink_tokens + frame_seqlen].clone()
-                            seed_v = kv_cache["v"][:, sink_tokens:sink_tokens + frame_seqlen].clone()
+                            seed_v = _ev_src_v[:, sink_tokens:sink_tokens + frame_seqlen].clone()
                             smem_long_k_new, smem_long_v_new = seed_k, seed_v
                             smem_short_k_new, smem_short_v_new = seed_k.clone(), seed_v.clone()
                             _init_sp = torch.arange(frame_seqlen, device=k.device, dtype=torch.float32).unsqueeze(0).expand(b, -1).clone()
@@ -1388,6 +1447,9 @@ class CausalWanSelfAttention(nn.Module):
                         "write_end_index": local_end_index,
                         "new_k": k[:, roped_offset:roped_offset + write_len],
                         "new_v": v[:, roped_offset:roped_offset + write_len],
+                        # exp5(B): original value for the smem_src_v mirror (here == new_v,
+                        # since refinement never happens on this rolling first-denoising pass).
+                        "new_v_orig": v[:, roped_offset:roped_offset + write_len],
                         "new_q": q[:, roped_offset:roped_offset + write_len],  # For Deep Forcing
                         "new_temporal_indices": new_temporal_indices,  # [write_len]
                         "new_spatial_indices": new_spatial_indices,    # [write_len]
@@ -1476,6 +1538,9 @@ class CausalWanSelfAttention(nn.Module):
                     "write_end_index": local_end_index,
                     "new_k": k[:, roped_offset:roped_offset + write_len],  # UN-ROPED K!
                     "new_v": _v_for_cache[:, roped_offset:roped_offset + write_len],
+                    # exp5(B): ORIGINAL value for the smem_src_v mirror (pre-refine).
+                    # Differs from new_v only on the clean pass (where new_v is refined).
+                    "new_v_orig": v[:, roped_offset:roped_offset + write_len],
                     "new_q": q[:, roped_offset:roped_offset + write_len],  # For Deep Forcing
                     "new_temporal_indices": new_temporal_indices,  # [write_len]
                     "new_spatial_indices": new_spatial_indices,    # [write_len]
@@ -1620,7 +1685,10 @@ class CausalWanAttentionBlock(nn.Module):
                  mem_value_refine_gate="matched",
                  mem_value_refine_tau=0.6,
                  mem_value_refine_beta=0.1,
-                 mem_value_refine_alpha=1.0):
+                 mem_value_refine_alpha=1.0,
+                 mem_value_refine_gate_fn="sigmoid",
+                 mem_value_refine_blocks="all",
+                 mem_value_refine_norm_restore=True):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -1632,7 +1700,7 @@ class CausalWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, recent_size, qk_norm, eps, use_block_rope, compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive, mem_logn_bias, mem_key_renorm, mem_side_buffer, mem_value_refine, mem_value_refine_gate, mem_value_refine_tau, mem_value_refine_beta, mem_value_refine_alpha)
+        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, recent_size, qk_norm, eps, use_block_rope, compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive, mem_logn_bias, mem_key_renorm, mem_side_buffer, mem_value_refine, mem_value_refine_gate, mem_value_refine_tau, mem_value_refine_beta, mem_value_refine_alpha, mem_value_refine_gate_fn, mem_value_refine_blocks, mem_value_refine_norm_restore)
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -1788,7 +1856,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  mem_value_refine_gate="matched",
                  mem_value_refine_tau=0.6,
                  mem_value_refine_beta=0.1,
-                 mem_value_refine_alpha=1.0):
+                 mem_value_refine_alpha=1.0,
+                 mem_value_refine_gate_fn="sigmoid",
+                 mem_value_refine_blocks="all",
+                 mem_value_refine_norm_restore=True):
         r"""
         Initialize the diffusion model backbone.
 
@@ -1868,7 +1939,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                                     compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive,
                                     mem_logn_bias, mem_key_renorm, mem_side_buffer,
                                     mem_value_refine, mem_value_refine_gate, mem_value_refine_tau,
-                                    mem_value_refine_beta, mem_value_refine_alpha)
+                                    mem_value_refine_beta, mem_value_refine_alpha, mem_value_refine_gate_fn, mem_value_refine_blocks, mem_value_refine_norm_restore)
             for _ in range(num_layers)
         ])
         # Tag each self-attention with its block index (for per-block instrumentation).
@@ -2053,6 +2124,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                     cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                    # exp5(B): roll the ORIGINAL-value mirror in lockstep.
+                    if "smem_src_v" in cache:
+                        cache["smem_src_v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                            cache["smem_src_v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                     if "q" in cache:
                         cache["q"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                             cache["q"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
@@ -2069,6 +2144,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     if write_end_index > write_start_index and new_k.shape[1] == (write_end_index - write_start_index):
                         cache["k"][:, write_start_index:write_end_index] = new_k
                         cache["v"][:, write_start_index:write_end_index] = new_v
+                        # exp5(B): mirror gets the ORIGINAL value.
+                        if "smem_src_v" in cache:
+                            cache["smem_src_v"][:, write_start_index:write_end_index] = \
+                                update_info.get("new_v_orig", new_v)
                         if new_q is not None and "q" in cache:
                             cache["q"][:, write_start_index:write_end_index] = new_q
                         # Store temporal/spatial indices for new tokens
@@ -2235,6 +2314,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     if write_end_index > write_start_index and new_k.shape[1] == (write_end_index - write_start_index):
                         cache["k"][:, write_start_index:write_end_index] = new_k
                         cache["v"][:, write_start_index:write_end_index] = new_v
+                        # exp5(B): mirror gets the ORIGINAL value (differs from new_v only
+                        # on the clean pass, where new_v is the refined value).
+                        if "smem_src_v" in cache:
+                            cache["smem_src_v"][:, write_start_index:write_end_index] = \
+                                update_info.get("new_v_orig", new_v)
                         if new_q is not None and "q" in cache:
                             cache["q"][:, write_start_index:write_end_index] = new_q
                         # Store temporal/spatial indices for new tokens
@@ -2242,7 +2326,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                             cache["token_temporal_indices"][:, write_start_index:write_end_index] = new_temporal_indices
                         if new_spatial_indices is not None and "token_spatial_indices" in cache:
                             cache["token_spatial_indices"][:, write_start_index:write_end_index] = new_spatial_indices
-            
+
             # Update indices: do not roll back pointers during recomputation
             is_recompute = False if update_info is None else update_info.get("is_recompute", False)
             if not is_recompute:

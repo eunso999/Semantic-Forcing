@@ -181,6 +181,9 @@ class WanDiffusionWrapper(torch.nn.Module):
             mem_value_refine_tau=0.6,
             mem_value_refine_beta=0.1,
             mem_value_refine_alpha=1.0,
+            mem_value_refine_gate_fn="sigmoid",
+            mem_value_refine_blocks="all",
+            mem_value_refine_norm_restore=True,
     ):
         super().__init__()
 
@@ -192,7 +195,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                 ema_adaptive=ema_adaptive, mem_logn_bias=mem_logn_bias, mem_key_renorm=mem_key_renorm,
                 mem_side_buffer=mem_side_buffer, mem_value_refine=mem_value_refine,
                 mem_value_refine_gate=mem_value_refine_gate, mem_value_refine_tau=mem_value_refine_tau,
-                mem_value_refine_beta=mem_value_refine_beta, mem_value_refine_alpha=mem_value_refine_alpha)
+                mem_value_refine_beta=mem_value_refine_beta, mem_value_refine_alpha=mem_value_refine_alpha,
+                mem_value_refine_gate_fn=mem_value_refine_gate_fn,
+                mem_value_refine_blocks=mem_value_refine_blocks,
+                mem_value_refine_norm_restore=mem_value_refine_norm_restore)
         else:
             self.model = WanModel.from_pretrained(f"checkpoints/{model_name}/")
         self.model.eval()

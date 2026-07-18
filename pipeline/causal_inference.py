@@ -332,6 +332,12 @@ class CausalInferencePipeline(torch.nn.Module):
                     "smem_spatial_long": torch.arange(M, dtype=torch.float32, device=blk_device).unsqueeze(0).expand(batch_size, -1).clone(),
                     "smem_spatial_short": torch.arange(M, dtype=torch.float32, device=blk_device).unsqueeze(0).expand(batch_size, -1).clone(),
                     "smem_init": False,
+                    # exp5(B): parallel ORIGINAL (pre-refinement) value cache, mirroring
+                    # cache["v"] layout and rolled in lockstep. The shadow memory reads
+                    # its evict source from here so it tracks the ORIGINAL clean content,
+                    # not the value-refined content written to cache["v"]. Key is never
+                    # refined, so cache["k"] is already original (no parallel needed).
+                    "smem_src_v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=blk_device),
                 })
 
         self.kv_cache1 = kv_cache1  # always store the clean cache
