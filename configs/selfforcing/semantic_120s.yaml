@@ -21,6 +21,11 @@ model_kwargs:
   compression_method: cluster
   ema_alpha_long: 0.01
   ema_alpha_short: 0.1
+  # exp3 memory-attention corrections (default off = identical to prior behavior).
+  # mem_logn_bias:  add log(n_i) to memory-key attention logits (n_i = effective count).
+  # mem_key_renorm: rescale memory prototype key to running-mean raw norm r_i at read.
+  mem_logn_bias: false
+  mem_key_renorm: false
 
 # Inference
 data_path: prompts/moviegenbench_128_refined.txt

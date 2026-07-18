@@ -304,6 +304,14 @@ class CausalInferencePipeline(torch.nn.Module):
                 # one entry per memory slot (frame_seq_length). Seeded to identity (h,w).
                 "proto_spatial_long": torch.arange(self.frame_seq_length, dtype=torch.float32, device=blk_device).unsqueeze(0).expand(batch_size, -1).clone(),
                 "proto_spatial_short": torch.arange(self.frame_seq_length, dtype=torch.float32, device=blk_device).unsqueeze(0).expand(batch_size, -1).clone(),
+                # exp3 (mem_logn_bias / mem_key_renorm): per-prototype effective count n_i
+                # and running-mean raw key-norm r_i, one per memory slot (frame_seq_length),
+                # long/short each. Seeded to 1 ("generation-time init to 1"). Unused unless
+                # the corresponding flag is on, so this is a no-op for default runs.
+                "mem_count_long": torch.ones([batch_size, self.frame_seq_length], dtype=torch.float32, device=blk_device),
+                "mem_count_short": torch.ones([batch_size, self.frame_seq_length], dtype=torch.float32, device=blk_device),
+                "mem_knorm_long": torch.ones([batch_size, self.frame_seq_length], dtype=torch.float32, device=blk_device),
+                "mem_knorm_short": torch.ones([batch_size, self.frame_seq_length], dtype=torch.float32, device=blk_device),
                 # For output_preserve compression: store selection computed at t=1000
                 "selected_token_indices": None,
                 "original_spatial_indices": None

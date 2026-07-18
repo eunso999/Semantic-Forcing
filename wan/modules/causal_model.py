@@ -488,7 +488,9 @@ def _record_key_attend_map(chunk, block, timestep, roped_q, roped_k, groups,
 
 def cluster_merge_update(evicted_k, evicted_v, evicted_spatial,
                          proto_k, proto_v, proto_spatial, alpha,
-                         sim_log_ctx=None):
+                         sim_log_ctx=None,
+                         proto_count=None, proto_knorm=None,
+                         want_count=False, want_knorm=False):
     """Content-aware online clustering update of memory prototypes.
 
     Each evicted (un-roped) token is hard-assigned to the most cosine-similar
@@ -505,10 +507,16 @@ def cluster_merge_update(evicted_k, evicted_v, evicted_spatial,
         proto_k/proto_v:     [B, M, n, d] current memory prototypes.
         proto_spatial:       [B, M] float running-mean spatial position.
         alpha:               scalar EMA rate.
+        proto_count:         [B, M] float per-prototype effective count n_i (exp3), or None.
+        proto_knorm:         [B, M] float per-prototype running-mean raw key norm r_i (exp3), or None.
+        want_count/want_knorm: only compute the corresponding new buffer when True;
+                             otherwise the input is returned unchanged (no-op, default off).
 
     Returns:
         new_proto_k, new_proto_v: [B, M, n, d]
         new_proto_spatial:        [B, M] float
+        new_proto_count:          [B, M] float (proto_count unchanged if want_count is False)
+        new_proto_knorm:          [B, M] float (proto_knorm unchanged if want_knorm is False)
     """
     B, E, n, d = evicted_k.shape
     M = proto_k.shape[1]
@@ -539,7 +547,65 @@ def cluster_merge_update(evicted_k, evicted_v, evicted_spatial,
     new_k = proto_k.float() + alpha * mk * (mean_k - proto_k.float())
     new_v = proto_v.float() + alpha * mk * (mean_v - proto_v.float())
     new_s = proto_spatial + alpha * mask * (mean_s - proto_spatial)
-    return new_k.type_as(proto_k), new_v.type_as(proto_v), new_s
+
+    # exp3 per-prototype scalars (computed only when requested; else passthrough).
+    new_count = proto_count
+    if want_count and proto_count is not None:
+        # assigned prototype: n_i <- (1-alpha)*n_i + 1 ; unassigned: unchanged.
+        new_count = proto_count + mask * (1.0 - alpha * proto_count)
+    new_knorm = proto_knorm
+    if want_knorm and proto_knorm is not None:
+        # r_i <- (1-alpha)*r_i + alpha*mean(member raw key norm), assigned only.
+        nrm = evicted_k.reshape(B, E, n * d).float().norm(dim=-1)   # [B, E] raw (pre-RoPE) key norm
+        mean_nrm = torch.einsum('bem,be->bm', A, nrm) / denom       # [B, M]
+        new_knorm = proto_knorm + alpha * mask * (mean_nrm - proto_knorm)
+
+    return new_k.type_as(proto_k), new_v.type_as(proto_v), new_s, new_count, new_knorm
+
+
+def _mem_logn_bias_vec(sink_tokens, frame_seqlen, Lk, n_long, n_short, dtype):
+    """exp3 mem_logn_bias: additive attention-logit bias [B, Lk] equal to
+    log(n_i) on the two memory frames (long/short) and 0 on sink/recent/current.
+    n_long/n_short: [B, M] per-prototype effective counts."""
+    B = n_long.shape[0]
+    bias = torch.zeros(B, Lk, device=n_long.device, dtype=torch.float32)
+    ml_end = sink_tokens + frame_seqlen
+    ms_end = ml_end + frame_seqlen
+    if ml_end <= Lk:
+        bias[:, sink_tokens:ml_end] = torch.log(n_long.float().clamp_min(1.0))
+    if ms_end <= Lk:
+        bias[:, ml_end:ms_end] = torch.log(n_short.float().clamp_min(1.0))
+    return bias.to(dtype)
+
+
+def _sdpa_attn_with_bias(q, k, v, bias_bl):
+    """SDPA attention with an additive per-key logit bias (FlashAttention exposes
+    no bias hook, so mem_logn_bias forces this path). Same conventions as
+    wan.modules.attention.attention: q/k/v are [B, L, n, d], scale = 1/sqrt(d)."""
+    qs = q.transpose(1, 2)   # [B, n, Lq, d]
+    ks = k.transpose(1, 2)
+    vs = v.transpose(1, 2)
+    attn_mask = bias_bl.view(bias_bl.shape[0], 1, 1, bias_bl.shape[1])  # broadcast heads/query
+    out = F.scaled_dot_product_attention(qs, ks, vs, attn_mask=attn_mask)
+    return out.transpose(1, 2).contiguous()   # [B, Lq, n, d]
+
+
+def _renorm_mem_inplace(temp_k, sink_tokens, frame_seqlen, n_heads, head_dim,
+                        r_long, r_short, eps=1e-6):
+    """exp3 mem_key_renorm: rescale each memory prototype key to its running-mean
+    raw norm r_i BEFORE RoPE. In-place on temp_k (a clone of the cache; the stored
+    cache is not modified). r_long/r_short: [B, M] or None (skip that frame)."""
+    B = temp_k.shape[0]
+    for start, r in ((sink_tokens, r_long), (sink_tokens + frame_seqlen, r_short)):
+        if r is None:
+            continue
+        end = start + frame_seqlen
+        if end > temp_k.shape[1]:
+            continue
+        seg = temp_k[:, start:end]                                                 # [B, M, n, d]
+        cn = seg.reshape(B, frame_seqlen, n_heads * head_dim).float().norm(dim=-1)  # [B, M]
+        fac = (r.float() / (cn + eps)).to(temp_k.dtype).view(B, frame_seqlen, 1, 1)
+        temp_k[:, start:end] = seg * fac
 
 
 class CausalWanSelfAttention(nn.Module):
@@ -556,7 +622,9 @@ class CausalWanSelfAttention(nn.Module):
                  compression_method='eviction',
                  ema_alpha_long=0.01,
                  ema_alpha_short=0.1,
-                 ema_adaptive=False):
+                 ema_adaptive=False,
+                 mem_logn_bias=False,
+                 mem_key_renorm=False):
         """
         Args:
             sink_size: number of sink frames to preserve at the beginning
@@ -585,6 +653,9 @@ class CausalWanSelfAttention(nn.Module):
         self.ema_alpha_long = ema_alpha_long
         self.ema_alpha_short = ema_alpha_short
         self.ema_adaptive = ema_adaptive
+        # exp3 memory-attention corrections (both default off => identical to prior behavior)
+        self.mem_logn_bias = mem_logn_bias
+        self.mem_key_renorm = mem_key_renorm
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
         if not isinstance(local_attn_size, int) and hasattr(local_attn_size, "__iter__"):
             values = list(local_attn_size)
@@ -732,7 +803,12 @@ class CausalWanSelfAttention(nn.Module):
             # Compute cache update parameters without modifying kv_cache directly
             cache_update_info = None
             is_recompute = current_end <= kv_cache["global_end_index"].item() and current_start > 0
-            
+            # exp3: freshly-computed per-prototype count/knorm for this pass (set only
+            # in the rolling cluster branch); None everywhere else. Declared here so
+            # the shared attention block below can read them regardless of branch.
+            mem_count_long_new = mem_count_short_new = None
+            mem_knorm_long_new = mem_knorm_short_new = None
+
             if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
                     num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
                 # === ROLLING MODE ===
@@ -791,6 +867,12 @@ class CausalWanSelfAttention(nn.Module):
                     cluster_long_k = cluster_long_v = None
                     cluster_short_k = cluster_short_v = None
                     proto_spatial_long_new = proto_spatial_short_new = None
+                    # exp3: per-prototype count n_i / key-norm r_i (None unless the
+                    # corresponding flag is on; otherwise never staged/written/read).
+                    mem_count_long_new = mem_count_short_new = None
+                    mem_knorm_long_new = mem_knorm_short_new = None
+                    _want_count = self.mem_logn_bias
+                    _want_knorm = self.mem_key_renorm
 
                     if is_recompute:
                         # At recompute, cache already has updated layout from t=1000
@@ -826,6 +908,15 @@ class CausalWanSelfAttention(nn.Module):
                             init_spatial = torch.arange(frame_seqlen, device=k.device, dtype=torch.float32)
                             proto_spatial_long_new = init_spatial.unsqueeze(0).expand(b, -1).clone()
                             proto_spatial_short_new = proto_spatial_long_new.clone()
+                            # exp3 seed: each prototype starts as one token -> count=1,
+                            # key-norm = the seed frame's raw per-prototype key norm.
+                            if _want_count:
+                                mem_count_long_new = torch.ones(b, frame_seqlen, device=k.device, dtype=torch.float32)
+                                mem_count_short_new = mem_count_long_new.clone()
+                            if _want_knorm:
+                                seed_norm = seed_k.reshape(b, frame_seqlen, n * d).float().norm(dim=-1)  # [b, M]
+                                mem_knorm_long_new = seed_norm.clone()
+                                mem_knorm_short_new = seed_norm.clone()
                         elif not ema_initialized:
                             # First time: initialize EMA
                             if num_evicted_tokens > 0:
@@ -873,14 +964,20 @@ class CausalWanSelfAttention(nn.Module):
                                     old_ps_short = kv_cache["proto_spatial_short"].clone()
                                     # Autoregressive chunk index (for similarity instrumentation).
                                     _sim_chunk_idx = int(current_start // frame_seqlen) // max(int(num_new_frames), 1)
-                                    cluster_long_k, cluster_long_v, proto_spatial_long_new = cluster_merge_update(
+                                    cluster_long_k, cluster_long_v, proto_spatial_long_new, mem_count_long_new, mem_knorm_long_new = cluster_merge_update(
                                         evicted_k, evicted_v, evicted_spatial,
                                         old_ema_long_k, old_ema_long_v, old_ps_long, self.ema_alpha_long,
-                                        sim_log_ctx=(_sim_chunk_idx, self.block_index, 'long'))
-                                    cluster_short_k, cluster_short_v, proto_spatial_short_new = cluster_merge_update(
+                                        sim_log_ctx=(_sim_chunk_idx, self.block_index, 'long'),
+                                        proto_count=(kv_cache["mem_count_long"] if _want_count else None),
+                                        proto_knorm=(kv_cache["mem_knorm_long"] if _want_knorm else None),
+                                        want_count=_want_count, want_knorm=_want_knorm)
+                                    cluster_short_k, cluster_short_v, proto_spatial_short_new, mem_count_short_new, mem_knorm_short_new = cluster_merge_update(
                                         evicted_k, evicted_v, evicted_spatial,
                                         old_ema_short_k, old_ema_short_v, old_ps_short, self.ema_alpha_short,
-                                        sim_log_ctx=(_sim_chunk_idx, self.block_index, 'short'))
+                                        sim_log_ctx=(_sim_chunk_idx, self.block_index, 'short'),
+                                        proto_count=(kv_cache["mem_count_short"] if _want_count else None),
+                                        proto_knorm=(kv_cache["mem_knorm_short"] if _want_knorm else None),
+                                        want_count=_want_count, want_knorm=_want_knorm)
                                     temp_k[:, ema_long_start:ema_long_end] = cluster_long_k
                                     temp_v[:, ema_long_start:ema_long_end] = cluster_long_v
                                     temp_k[:, ema_short_start:ema_short_end] = cluster_short_k
@@ -964,6 +1061,13 @@ class CausalWanSelfAttention(nn.Module):
                         q, grid_sizes, freqs, relative_frame_indices=query_relative_indices
                     ).type_as(v)
 
+                    # exp3 mem_key_renorm: rescale memory prototype keys to running-mean
+                    # raw norm r_i BEFORE RoPE (cluster-mode only; no-op if flag off).
+                    if self.mem_key_renorm and is_cluster and local_end_index >= sink_tokens + 2 * frame_seqlen:
+                        _r_long = mem_knorm_long_new if mem_knorm_long_new is not None else kv_cache.get("mem_knorm_long")
+                        _r_short = mem_knorm_short_new if mem_knorm_short_new is not None else kv_cache.get("mem_knorm_short")
+                        _renorm_mem_inplace(temp_k, sink_tokens, frame_seqlen, n, d, _r_long, _r_short)
+
                     cache_relative_indices = torch.arange(0, num_cache_frames, device=k.device)
                     if is_cluster:
                         # Spatial-aware RoPE: memory frames (long/short, right after the
@@ -1030,6 +1134,11 @@ class CausalWanSelfAttention(nn.Module):
                         "cluster_short_v": cluster_short_v,
                         "proto_spatial_long": proto_spatial_long_new,
                         "proto_spatial_short": proto_spatial_short_new,
+                        # exp3 per-prototype scalars (None unless flag on -> not written)
+                        "mem_count_long": mem_count_long_new,
+                        "mem_count_short": mem_count_short_new,
+                        "mem_knorm_long": mem_knorm_long_new,
+                        "mem_knorm_short": mem_knorm_short_new,
                     }
 
                 else:
@@ -1136,6 +1245,15 @@ class CausalWanSelfAttention(nn.Module):
                     q, grid_sizes, freqs, relative_frame_indices=query_relative_indices
                 ).type_as(v)
 
+                # exp3 mem_key_renorm (recompute / direct-insert path): rescale memory
+                # prototype keys to r_i before RoPE. mem frames are still resident here
+                # (see recompute note); use the persisted buffer written at t=1000.
+                if (self.mem_key_renorm and self.compression_method == 'cluster'
+                        and kv_cache.get("ema_initialized")
+                        and local_end_index >= sink_tokens + 2 * frame_seqlen):
+                    _renorm_mem_inplace(temp_k, sink_tokens, frame_seqlen, n, d,
+                                        kv_cache.get("mem_knorm_long"), kv_cache.get("mem_knorm_short"))
+
                 # Cached K: apply RoPE dynamically
                 num_cache_frames = local_end_index // frame_seqlen
                 cache_relative_indices = torch.arange(0, num_cache_frames, device=k.device)
@@ -1234,16 +1352,33 @@ class CausalWanSelfAttention(nn.Module):
                             _record_key_attend_map(_ka_chunk, self.block_index, _KEY_ATTEND_TIMESTEP,
                                                    roped_query, k_cat, _ka_groups,
                                                    num_new_frames, frame_seqlen, grid_sizes)
+
+                    # exp3 mem_logn_bias: add log(n_i) to memory-key logits (cluster-mode,
+                    # full window, mem resident). FA2 exposes no bias hook, so route
+                    # through SDPA when on; off => unchanged flash path below.
+                    _use_logn = (self.mem_logn_bias and self.compression_method == 'cluster'
+                                 and local_start_for_window == sink_tokens
+                                 and local_end_index >= sink_tokens + 2 * frame_seqlen
+                                 and (kv_cache.get("ema_initialized")
+                                      or (cache_update_info and cache_update_info.get("action") == "ema")))
                 else:
                     k_cat = k_sink
                     v_cat = v_sink
+                    _use_logn = False
 
-                x = attention(
-                    roped_query,
-                    k_cat,
-                    v_cat,
-                    deterministic=True
-                )
+                if _use_logn:
+                    _n_long = mem_count_long_new if mem_count_long_new is not None else kv_cache.get("mem_count_long")
+                    _n_short = mem_count_short_new if mem_count_short_new is not None else kv_cache.get("mem_count_short")
+                    _logn_bias = _mem_logn_bias_vec(sink_tokens, frame_seqlen, k_cat.shape[1],
+                                                    _n_long, _n_short, roped_query.dtype)
+                    x = _sdpa_attn_with_bias(roped_query, k_cat, v_cat, _logn_bias)
+                else:
+                    x = attention(
+                        roped_query,
+                        k_cat,
+                        v_cat,
+                        deterministic=True
+                    )
             else:
                 window_start = max(0, local_end_index - self.max_attention_size)
 
@@ -1282,7 +1417,9 @@ class CausalWanAttentionBlock(nn.Module):
                  compression_method='eviction',
                  ema_alpha_long=0.01,
                  ema_alpha_short=0.1,
-                 ema_adaptive=False):
+                 ema_adaptive=False,
+                 mem_logn_bias=False,
+                 mem_key_renorm=False):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -1294,7 +1431,7 @@ class CausalWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, recent_size, qk_norm, eps, use_block_rope, compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive)
+        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, recent_size, qk_norm, eps, use_block_rope, compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive, mem_logn_bias, mem_key_renorm)
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -1442,7 +1579,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  compression_method='eviction',
                  ema_alpha_long=0.01,
                  ema_alpha_short=0.1,
-                 ema_adaptive=False):
+                 ema_adaptive=False,
+                 mem_logn_bias=False,
+                 mem_key_renorm=False):
         r"""
         Initialize the diffusion model backbone.
 
@@ -1519,7 +1658,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
                                     local_attn_size, sink_size, recent_size, qk_norm, cross_attn_norm, eps, use_block_rope,
-                                    compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive)
+                                    compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive,
+                                    mem_logn_bias, mem_key_renorm)
             for _ in range(num_layers)
         ])
         # Tag each self-attention with its block index (for per-block instrumentation).
@@ -1779,6 +1919,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                                 if "token_spatial_indices" in cache:
                                     cache["token_spatial_indices"][:, ema_long_start:ema_long_end] = psl.round().long().clamp(0, frame_seqlen - 1)
                                     cache["token_spatial_indices"][:, ema_short_start:ema_short_end] = pss.round().long().clamp(0, frame_seqlen - 1)
+                            # exp3: persist per-prototype count / key-norm (only if flag on)
+                            mcl = update_info.get("mem_count_long")
+                            if mcl is not None:
+                                cache["mem_count_long"] = mcl
+                                cache["mem_count_short"] = update_info["mem_count_short"]
+                            mkl = update_info.get("mem_knorm_long")
+                            if mkl is not None:
+                                cache["mem_knorm_long"] = mkl
+                                cache["mem_knorm_short"] = update_info["mem_knorm_short"]
                             cache["ema_initialized"] = True
                         else:
                             # Check if EMA is initialized

@@ -173,6 +173,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             ema_alpha_long=0.01,
             ema_alpha_short=0.1,
             ema_adaptive=False,
+            mem_logn_bias=False,
+            mem_key_renorm=False,
     ):
         super().__init__()
 
@@ -181,7 +183,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 f"checkpoints/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size,
                 recent_size=recent_size, use_block_rope=use_block_rope, compression_method=compression_method,
                 ema_alpha_long=ema_alpha_long, ema_alpha_short=ema_alpha_short,
-                ema_adaptive=ema_adaptive)
+                ema_adaptive=ema_adaptive, mem_logn_bias=mem_logn_bias, mem_key_renorm=mem_key_renorm)
         else:
             self.model = WanModel.from_pretrained(f"checkpoints/{model_name}/")
         self.model.eval()
