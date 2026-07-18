@@ -933,15 +933,19 @@ class CausalWanSelfAttention(nn.Module):
                         num_new_frames, frame_seqlen, grid_sizes)
 
             # exp5: refine the new clean recent VALUE tokens toward the long memory
-            # prototypes (key-matched, soft-gated convex blend) BEFORE they are
-            # written to the cache. Clean pass only (_KEY_ATTEND_TIMESTEP is None)
-            # so denoising-pass values (and the current frame's output) are unchanged;
-            # the refined value becomes recent for future chunks. Key stays original.
-            # No-op unless the flag is on and shadow memory is initialized.
+            # prototypes (key-matched, soft-gated convex blend). CACHE-ONLY: we do
+            # NOT reassign `v`, so this block's attention (and every downstream
+            # block's clean k/v prediction within this forward) is UNCHANGED. Only
+            # the value written to the cache (cache_update_info["new_v"]) is
+            # replaced by the refined value, per block independently, so the refined
+            # value becomes recent for future chunks while the key stays original.
+            # Clean pass only (_KEY_ATTEND_TIMESTEP is None). No-op unless the flag
+            # is on and shadow memory is initialized.
+            v_refined_for_cache = None
             if (self.mem_value_refine and _KEY_ATTEND_TIMESTEP is None
                     and self.compression_method == 'eviction'
                     and kv_cache.get("smem_init", False)):
-                v = _refine_value_with_memory(
+                v_refined_for_cache = _refine_value_with_memory(
                     k, v, kv_cache["smem_long_k"], kv_cache["smem_long_v"],
                     gate_mode=self.mem_value_refine_gate,
                     tau=self.mem_value_refine_tau,
@@ -1457,6 +1461,12 @@ class CausalWanSelfAttention(nn.Module):
                 new_temporal_indices = (new_token_global_start + new_token_positions) // frame_seqlen
                 new_spatial_indices = (new_token_global_start + new_token_positions) % frame_seqlen
 
+                # exp5 cache-only refine: the value WRITTEN to cache uses the refined
+                # tensor (if produced this clean pass); attention above still used the
+                # original `v` (via temp_v), so this block's output and every
+                # downstream block's clean k/v are unchanged. Key stays original `k`.
+                _v_for_cache = v_refined_for_cache if v_refined_for_cache is not None else v
+
                 # Save cache update info - store UN-ROPED K!
                 cache_update_info = {
                     "action": "direct_insert",
@@ -1465,7 +1475,7 @@ class CausalWanSelfAttention(nn.Module):
                     "write_start_index": write_start_index,
                     "write_end_index": local_end_index,
                     "new_k": k[:, roped_offset:roped_offset + write_len],  # UN-ROPED K!
-                    "new_v": v[:, roped_offset:roped_offset + write_len],
+                    "new_v": _v_for_cache[:, roped_offset:roped_offset + write_len],
                     "new_q": q[:, roped_offset:roped_offset + write_len],  # For Deep Forcing
                     "new_temporal_indices": new_temporal_indices,  # [write_len]
                     "new_spatial_indices": new_spatial_indices,    # [write_len]
