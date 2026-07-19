@@ -1,6 +1,7 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: Apache-2.0
 from typing import List
+import os
 import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
@@ -90,6 +91,13 @@ class CausalInferencePipeline(torch.nn.Module):
             device=output_device,
             dtype=noise.dtype
         )
+
+        # exp5 analysis (CLEAN_KV_IMG=1): also capture the clean-context pass's x0
+        # prediction (Step 2.3, normally discarded) so we can compare it against
+        # the denoising output (Step 2.2). No effect on the generated video.
+        _clean_kv_img = os.environ.get("CLEAN_KV_IMG", "0") not in ("0", "", "false", "False")
+        self.last_clean_video = None
+        output_clean = torch.zeros_like(output) if _clean_kv_img else None
 
         # Set up profiling if requested
         if profile:
@@ -202,7 +210,7 @@ class CausalInferencePipeline(torch.nn.Module):
             # denoising timestep we plot).
             set_key_attend_timestep(None)
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
-            self.generator(
+            _clean_ret = self.generator(
                 noisy_image_or_video=denoised_pred,
                 conditional_dict=conditional_dict,
                 timestep=context_timestep,
@@ -210,6 +218,11 @@ class CausalInferencePipeline(torch.nn.Module):
                 crossattn_cache=self.crossattn_cache,
                 current_start=current_start_frame * self.frame_seq_length,
             )
+            # exp5 analysis: stash the clean-context pass's x0 prediction (its
+            # second return value) for this chunk. Cache update is unaffected.
+            if output_clean is not None:
+                output_clean[:, current_start_frame:current_start_frame + current_num_frames] = \
+                    _clean_ret[1].to(output.device)
             if profile:
                 block_end.record()
                 torch.cuda.synchronize()
@@ -250,6 +263,13 @@ class CausalInferencePipeline(torch.nn.Module):
         decode_device = vae_device if vae_device is not None else noise.device
         video = self.vae.decode_to_pixel(output.to(decode_device), use_cache=False)
         video = (video * 0.5 + 0.5).clamp(0, 1)
+
+        # exp5 analysis: decode the clean-context pass output too (same pipeline)
+        # so the caller can concat it with the denoising output for comparison.
+        if output_clean is not None:
+            self.vae.model.clear_cache()
+            _cv = self.vae.decode_to_pixel(output_clean.to(decode_device), use_cache=False)
+            self.last_clean_video = (_cv * 0.5 + 0.5).clamp(0, 1).to(noise.device)
         if profile:
             # End VAE timing and synchronize CUDA
             vae_end.record()

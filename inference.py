@@ -239,6 +239,11 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         from wan.modules.causal_model import enable_mem_sim_map
         enable_mem_sim_map(_msmap_chunks, _msmap_dir)
 
+    # Optional (exp5 analysis, CLEAN_KV_IMG=1): the pipeline captures the clean-
+    # context pass's x0 prediction; below we save a side-by-side video
+    # [denoising output | clean-context output] for comparison. No effect on video.
+    _cleankv_on = os.environ.get("CLEAN_KV_IMG", "0") not in ("0", "", "false", "False")
+
     # Use CPU generator for cross-hardware reproducibility
     generator = torch.Generator(device='cpu').manual_seed(config.seed)
     sampled_noise = torch.randn(
@@ -324,6 +329,15 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             else:
                 output_path = os.path.join(config.output_folder, f'rank{rank}-{prompt[:100]}-{seed_idx}.mp4')
             write_video(output_path, video_out[seed_idx], fps=16)
+
+            # exp5 analysis: save [denoising | clean-context] side-by-side video.
+            if _cleankv_on and getattr(pipeline, "last_clean_video", None) is not None:
+                clean_out = 255.0 * rearrange(pipeline.last_clean_video, 'b t c h w -> b t h w c').cpu()
+                # horizontal concat along width (dim=2 of [t, h, w, c])
+                concat = torch.cat([video_out[seed_idx], clean_out[seed_idx]], dim=2).clamp(0, 255)
+                cpath = os.path.join(config.output_folder, f'rank{rank}-{idx}-{seed_idx}_{model_type}_cleancat.mp4')
+                write_video(cpath, concat, fps=16)
+                print(f"[clean_kv_img] saved side-by-side (denoised | clean) -> {cpath}")
 
     if config.inference_iter != -1 and i >= config.inference_iter:
         break

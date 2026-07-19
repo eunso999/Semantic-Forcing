@@ -566,7 +566,8 @@ def _parse_block_spec(spec):
 
 def _refine_value_with_memory(k_new, v_new, proto_k, proto_v,
                               gate_mode="matched", tau=0.6, beta=0.1, alpha=1.0,
-                              gate_fn="sigmoid", norm_restore=True):
+                              gate_fn="sigmoid", norm_restore=True,
+                              aggregate="top1", temp=0.1):
     """exp5: refine new (clean recent) VALUE tokens toward memory (long prototypes).
 
     For each new token: match by KEY cos-sim to the top-1 prototype (j*), fetch
@@ -584,6 +585,13 @@ def _refine_value_with_memory(k_new, v_new, proto_k, proto_v,
       "sigmoid" : g = alpha * sigmoid((tau - vsim) / beta)        (smooth; beta = temperature)
       "relu"    : g = alpha * clamp((tau - vsim) / tau, min=0)    (piecewise-linear; exactly 0 at vsim >= tau)
 
+    aggregate (how the memory value target pv_target is formed):
+      "top1" : pv_target = proto_v[argmax_j cos-sim(new_k, proto_k[j])]   (hard top-1, original)
+      "attn" : pv_target = per-head cosine attention read from memory,
+               softmax(cos(new_k_h, proto_k_h) / temp) @ proto_v_h        (soft aggregate)
+    temp: temperature for the "attn" softmax (smaller = sharper -> closer to top-1;
+      larger = flatter -> closer to the mean of prototype values, can blur).
+
     norm_restore: if True, after blending, rescale each head-vector back to the
       ORIGINAL v_new head-norm. The convex blend shrinks the norm (mixing two
       directions) which blurs the value; restoring the magnitude keeps the
@@ -595,17 +603,28 @@ def _refine_value_with_memory(k_new, v_new, proto_k, proto_v,
     """
     B, Lq, n, d = k_new.shape
     M = proto_k.shape[1]
-    kf = F.normalize(k_new.reshape(B, Lq, n * d).float(), dim=-1)
-    pkf = F.normalize(proto_k.reshape(B, M, n * d).float(), dim=-1)
-    jstar = torch.matmul(kf, pkf.transpose(1, 2)).argmax(dim=-1)        # [B, Lq] key top-1
-    idx = jstar[:, :, None, None].expand(-1, -1, n, d)                  # [B, Lq, n, d]
-    pv_match = torch.gather(proto_v, 1, idx)                           # [B, Lq, n, d]
+
+    # --- form the memory value target pv_target [B, Lq, n, d] ---
+    if aggregate == "attn":
+        # per-head cosine attention read from memory, via the fused flash/SDPA
+        # kernel (no [Lq, M] score matrix materialized). Pre-normalize q,k so the
+        # dot-product is cosine; softmax_scale = 1/temp makes scores = cosine/temp.
+        qh = F.normalize(k_new.float(), dim=-1).to(v_new.dtype)          # [B, Lq, n, d]
+        kh = F.normalize(proto_k.float(), dim=-1).to(v_new.dtype)        # [B, M, n, d]
+        pv_match = attention(qh, kh, proto_v, softmax_scale=1.0 / float(temp),
+                             deterministic=True)                        # [B, Lq, n, d]
+    else:  # "top1" (hard argmax match)
+        kf = F.normalize(k_new.reshape(B, Lq, n * d).float(), dim=-1)
+        pkf = F.normalize(proto_k.reshape(B, M, n * d).float(), dim=-1)
+        jstar = torch.matmul(kf, pkf.transpose(1, 2)).argmax(dim=-1)    # [B, Lq] key top-1
+        idx = jstar[:, :, None, None].expand(-1, -1, n, d)             # [B, Lq, n, d]
+        pv_match = torch.gather(proto_v, 1, idx)                       # [B, Lq, n, d]
 
     vf = F.normalize(v_new.reshape(B, Lq, n * d).float(), dim=-1)
     if gate_mode == "top1":
         pvf = F.normalize(proto_v.reshape(B, M, n * d).float(), dim=-1)
         vsim = torch.matmul(vf, pvf.transpose(1, 2)).max(dim=-1).values  # [B, Lq]
-    else:  # "matched"
+    else:  # "matched" -> against the blend target pv_target
         pvm = F.normalize(pv_match.reshape(B, Lq, n * d).float(), dim=-1)
         vsim = (vf * pvm).sum(dim=-1)                                    # [B, Lq]
 
@@ -772,7 +791,9 @@ class CausalWanSelfAttention(nn.Module):
                  mem_value_refine_alpha=1.0,
                  mem_value_refine_gate_fn="sigmoid",
                  mem_value_refine_blocks="all",
-                 mem_value_refine_norm_restore=True):
+                 mem_value_refine_norm_restore=True,
+                 mem_value_refine_aggregate="top1",
+                 mem_value_refine_temp=0.1):
         """
         Args:
             sink_size: number of sink frames to preserve at the beginning
@@ -821,6 +842,8 @@ class CausalWanSelfAttention(nn.Module):
         # None => all blocks; else a set of block indices where refine is applied.
         self.mem_value_refine_blocks = _parse_block_spec(mem_value_refine_blocks)
         self.mem_value_refine_norm_restore = mem_value_refine_norm_restore
+        self.mem_value_refine_aggregate = mem_value_refine_aggregate
+        self.mem_value_refine_temp = mem_value_refine_temp
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
         if not isinstance(local_attn_size, int) and hasattr(local_attn_size, "__iter__"):
             values = list(local_attn_size)
@@ -1005,7 +1028,9 @@ class CausalWanSelfAttention(nn.Module):
                     beta=self.mem_value_refine_beta,
                     alpha=self.mem_value_refine_alpha,
                     gate_fn=self.mem_value_refine_gate_fn,
-                    norm_restore=self.mem_value_refine_norm_restore)
+                    norm_restore=self.mem_value_refine_norm_restore,
+                    aggregate=self.mem_value_refine_aggregate,
+                    temp=self.mem_value_refine_temp)
 
             # exp3: freshly-computed per-prototype count/knorm for this pass (set only
             # in the rolling cluster branch); None everywhere else. Declared here so
@@ -1688,7 +1713,9 @@ class CausalWanAttentionBlock(nn.Module):
                  mem_value_refine_alpha=1.0,
                  mem_value_refine_gate_fn="sigmoid",
                  mem_value_refine_blocks="all",
-                 mem_value_refine_norm_restore=True):
+                 mem_value_refine_norm_restore=True,
+                 mem_value_refine_aggregate="top1",
+                 mem_value_refine_temp=0.1):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -1700,7 +1727,7 @@ class CausalWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, recent_size, qk_norm, eps, use_block_rope, compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive, mem_logn_bias, mem_key_renorm, mem_side_buffer, mem_value_refine, mem_value_refine_gate, mem_value_refine_tau, mem_value_refine_beta, mem_value_refine_alpha, mem_value_refine_gate_fn, mem_value_refine_blocks, mem_value_refine_norm_restore)
+        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, recent_size, qk_norm, eps, use_block_rope, compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive, mem_logn_bias, mem_key_renorm, mem_side_buffer, mem_value_refine, mem_value_refine_gate, mem_value_refine_tau, mem_value_refine_beta, mem_value_refine_alpha, mem_value_refine_gate_fn, mem_value_refine_blocks, mem_value_refine_norm_restore, mem_value_refine_aggregate, mem_value_refine_temp)
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -1859,7 +1886,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  mem_value_refine_alpha=1.0,
                  mem_value_refine_gate_fn="sigmoid",
                  mem_value_refine_blocks="all",
-                 mem_value_refine_norm_restore=True):
+                 mem_value_refine_norm_restore=True,
+                 mem_value_refine_aggregate="top1",
+                 mem_value_refine_temp=0.1):
         r"""
         Initialize the diffusion model backbone.
 
@@ -1939,7 +1968,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                                     compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive,
                                     mem_logn_bias, mem_key_renorm, mem_side_buffer,
                                     mem_value_refine, mem_value_refine_gate, mem_value_refine_tau,
-                                    mem_value_refine_beta, mem_value_refine_alpha, mem_value_refine_gate_fn, mem_value_refine_blocks, mem_value_refine_norm_restore)
+                                    mem_value_refine_beta, mem_value_refine_alpha, mem_value_refine_gate_fn, mem_value_refine_blocks, mem_value_refine_norm_restore, mem_value_refine_aggregate, mem_value_refine_temp)
             for _ in range(num_layers)
         ])
         # Tag each self-attention with its block index (for per-block instrumentation).

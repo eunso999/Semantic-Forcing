@@ -21,14 +21,14 @@
 set -e
 
 CONFIG=${1:-configs/selfforcing/semantic_120s.yaml}
-START=${2:-4}
-END=${3:-5}
+START=${2:-0}
+END=${3:-4}
 GATE=${4:-matched} # matched or top1
-TAU=${5:-0.5}
-BETA=${6:-0.05} # 0.1
+TAU=${5:-0.6}
+BETA=${6:-0.02} # 0.1
 ALPHA=${7:-0.5}
 GATE_FN=${8:-sigmoid} # relu or sigmoid
-EMA_LONG=${9:-0.005} # shadow long-memory EMA rate (smaller = slower/less update; config default was 0.01)
+EMA_LONG=${9:-0.0001} # shadow long-memory EMA rate (smaller = slower/less update; config default was 0.01)
 BLOCKS=${10:-"all"} # which blocks to refine: "all" | "10,11,12" | "10-20" | "0,5,10-12"
 NORM_RESTORE=${11:-true} # restore original head-norm after blend (avoid blur): true|false
 OUT=./outputs/selfforcing/120s_semantic_exp4_update_kv_prototype

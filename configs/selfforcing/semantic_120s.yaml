@@ -43,6 +43,10 @@ model_kwargs:
   # after blending, rescale each head-vector back to the original v_new norm
   # (blend shrinks norm -> blur; restoring magnitude keeps energy). true|false
   mem_value_refine_norm_restore: true
+  # how the memory value target is aggregated: "top1" (hard argmax match) |
+  # "attn" (per-head cosine attention read from memory, temperature=temp).
+  mem_value_refine_aggregate: top1
+  mem_value_refine_temp: 0.1
 
 # Inference
 data_path: prompts/moviegenbench_128_refined.txt
