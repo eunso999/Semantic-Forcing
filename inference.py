@@ -244,6 +244,18 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     # [denoising output | clean-context output] for comparison. No effect on video.
     _cleankv_on = os.environ.get("CLEAN_KV_IMG", "0") not in ("0", "", "false", "False")
 
+    # Optional (exp5 analysis): CLEAN_KV_ATTEND="chunks" records the per-slot
+    # attention-weight overlay (same as KEY_ATTEND_MAP) but during the CLEAN k/v
+    # prediction pass instead of the denoising passes.
+    _ckva_env = os.environ.get("CLEAN_KV_ATTEND", "").strip()
+    _ckva_on = _ckva_env not in ("", "0", "false", "False")
+    _ckva_chunks, _ckva_dir = [], None
+    if _ckva_on:
+        _ckva_chunks = [int(x) for x in _ckva_env.replace(" ", "").split(",") if x != ""]
+        _ckva_dir = os.path.join(config.output_folder, "clean_kv_attend", f"sample_{idx:04d}")
+        from wan.modules.causal_model import enable_key_attend_map_clean
+        enable_key_attend_map_clean(_ckva_chunks, _ckva_dir)
+
     # Use CPU generator for cross-hardware reproducibility
     generator = torch.Generator(device='cpu').manual_seed(config.seed)
     sampled_noise = torch.randn(
@@ -306,6 +318,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         _dump_chunk_frames(_kamap_dir, _kamap_chunks, "key_attend_map")
     if _msmap_on and local_rank == 0 and _msmap_dir is not None:
         _dump_chunk_frames(_msmap_dir, _msmap_chunks, "mem_sim_map")
+    if _ckva_on and local_rank == 0 and _ckva_dir is not None:
+        _dump_chunk_frames(_ckva_dir, _ckva_chunks, "clean_kv_attend")
 
     # Clear VAE cache
     pipeline.vae.model.clear_cache()

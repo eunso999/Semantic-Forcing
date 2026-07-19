@@ -47,6 +47,19 @@ model_kwargs:
   # "attn" (per-head cosine attention read from memory, temperature=temp).
   mem_value_refine_aggregate: top1
   mem_value_refine_temp: 0.1
+  # exp6 (default 0 = off). >0 splits the eviction past window into
+  # [update N frame (refined) | recent 1 frame (raw)]: the frame(s) crossing
+  # recent->update each roll are value-refined once (same replace machinery) and
+  # persisted into cache["v"]; recent/curr stay raw. Requires eviction +
+  # mem_side_buffer. Independent of mem_value_refine (curr clean-refine); set
+  # mem_value_refine=false to keep curr raw. e.g. layout with sink_size=5,
+  # update_size=3, local_attn_size=12, num_frame_per_block=3 ->
+  # [sink 5 | update 3 | recent 1 | curr 3].
+  mem_value_refine_update_size: 0
+  # exp5: scale attention to RECENT keys during the clean k/v prediction pass
+  # (1.0 = no change; 0.5 = halve recent's attention). Changes the cached clean
+  # k/v -> affects generation.
+  clean_recent_attn_scale: 1.0
 
 # Inference
 data_path: prompts/moviegenbench_128_refined.txt

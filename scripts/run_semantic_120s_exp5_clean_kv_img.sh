@@ -18,8 +18,8 @@
 set -e
 
 CONFIG=${1:-configs/selfforcing/semantic_120s.yaml}
-START=${2:-0}
-END=${3:-4}
+START=${2:-4}
+END=${3:-5}
 OUT=./outputs/selfforcing/120s_semantic_exp5_clean_kv_img
 
 # Separate output dir; use the config's model settings as-is (no forced refine).

@@ -403,8 +403,12 @@ def _record_key_attend(chunk_idx, block_idx, timestep, roped_q, roped_k, groups)
 #            overlaid on the decoded RGB frames.
 # Disabled unless _KEY_ATTEND_MAP_DIR is set (via enable_key_attend_map).
 # ---------------------------------------------------------------------------
-_KEY_ATTEND_MAP_DIR = None       # output dir; None disables.
+_KEY_ATTEND_MAP_DIR = None       # output dir; None disables (denoising-pass v2).
 _KEY_ATTEND_MAP_CHUNKS = set()   # only these autoregressive chunk indices.
+# exp5 clean-pass variant: same attention-weight overlay, but recorded during the
+# CLEAN-context pass (clean k/v prediction) instead of the denoising passes.
+_KEY_ATTEND_MAP_CLEAN_DIR = None
+_KEY_ATTEND_MAP_CLEAN_CHUNKS = set()
 
 
 def enable_key_attend_map(chunks, out_dir):
@@ -418,7 +422,18 @@ def enable_key_attend_map(chunks, out_dir):
         os.makedirs(os.path.join(out_dir, "spatial"), exist_ok=True)
 
 
-def _render_slot_heatmap(pertoken, slot_names, F, frame_seqlen, chunk, block, timestep):
+def enable_key_attend_map_clean(chunks, out_dir):
+    """exp5: enable the attention-weight overlay recorded on the CLEAN-context
+    pass (clean k/v prediction), for the given chunk indices."""
+    global _KEY_ATTEND_MAP_CLEAN_DIR, _KEY_ATTEND_MAP_CLEAN_CHUNKS
+    _KEY_ATTEND_MAP_CLEAN_DIR = out_dir
+    _KEY_ATTEND_MAP_CLEAN_CHUNKS = set(int(c) for c in chunks) if chunks else set()
+    if out_dir is not None:
+        os.makedirs(os.path.join(out_dir, "heatmap"), exist_ok=True)
+        os.makedirs(os.path.join(out_dir, "spatial"), exist_ok=True)
+
+
+def _render_slot_heatmap(pertoken, slot_names, F, frame_seqlen, chunk, block, timestep, out_dir):
     """part 2: query(rows) x slot(cols) heatmap of the per-token mean attention
     weight (slot mass / #tokens in slot). Small and fast to render, and the
     size-normalized values are comparable across slots (unlike the raw full
@@ -438,18 +453,21 @@ def _render_slot_heatmap(pertoken, slot_names, F, frame_seqlen, chunk, block, ti
     ax.set_title(f"per-token mean attn — chunk {chunk}, block {block}, t={timestep}")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="per-token mean attn weight")
     fig.tight_layout()
-    out = os.path.join(_KEY_ATTEND_MAP_DIR, "heatmap",
+    out = os.path.join(out_dir, "heatmap",
                        f"chunk{chunk:04d}_block{block:02d}_t{timestep:04d}.png")
     fig.savefig(out, dpi=130)
     plt.close(fig)
 
 
 def _record_key_attend_map(chunk, block, timestep, roped_q, roped_k, groups,
-                           num_new_frames, frame_seqlen, grid_sizes):
+                           num_new_frames, frame_seqlen, grid_sizes, out_dir=None):
     """Head-averaged attention aggregated PER SLOT (not the full q x k matrix):
     emit a part2 query x slot per-token-mean heatmap and a part3 per-slot spatial
-    mass (sum). Only slot sums are accumulated, so no [Lq, Lk] matrix is kept."""
-    if _KEY_ATTEND_MAP_DIR is None:
+    mass (sum). Only slot sums are accumulated, so no [Lq, Lk] matrix is kept.
+    out_dir defaults to the denoising-pass dir; pass the clean dir for exp5."""
+    if out_dir is None:
+        out_dir = _KEY_ATTEND_MAP_DIR
+    if out_dir is None:
         return
     B, Lq, n, d = roped_q.shape
     Lk = roped_k.shape[1]
@@ -475,10 +493,10 @@ def _record_key_attend_map(chunk, block, timestep, roped_q, roped_k, groups,
     # part 2: per-token mean = slot mass / #tokens in slot -> query x slot heatmap.
     slot_pertoken = (slot_sum / counts).numpy()
     _render_slot_heatmap(slot_pertoken, slot_names, int(num_new_frames),
-                         int(frame_seqlen), chunk, block, timestep)
+                         int(frame_seqlen), chunk, block, timestep, out_dir)
 
     # part 3: per-query slot mass (sum) for the RGB overlay.
-    out = os.path.join(_KEY_ATTEND_MAP_DIR, "spatial",
+    out = os.path.join(out_dir, "spatial",
                        f"chunk{chunk:04d}_block{block:02d}_t{timestep:04d}.npy")
     np.save(out, {"slot_mass": slot_sum.numpy().astype(np.float32), "slots": slot_names,
                   "F": int(num_new_frames), "H": H, "W": W,
@@ -584,6 +602,8 @@ def _refine_value_with_memory(k_new, v_new, proto_k, proto_v,
     gate_fn (how vsim maps to the blend weight g; low vsim -> larger g):
       "sigmoid" : g = alpha * sigmoid((tau - vsim) / beta)        (smooth; beta = temperature)
       "relu"    : g = alpha * clamp((tau - vsim) / tau, min=0)    (piecewise-linear; exactly 0 at vsim >= tau)
+      "hard"    : g = alpha * (vsim < tau)                        ("replace" mode: step gate;
+                  alpha=1.0 hard-replaces tokens with vsim<tau by pv_match, others untouched)
 
     aggregate (how the memory value target pv_target is formed):
       "top1" : pv_target = proto_v[argmax_j cos-sim(new_k, proto_k[j])]   (hard top-1, original)
@@ -628,7 +648,13 @@ def _refine_value_with_memory(k_new, v_new, proto_k, proto_v,
         pvm = F.normalize(pv_match.reshape(B, Lq, n * d).float(), dim=-1)
         vsim = (vf * pvm).sum(dim=-1)                                    # [B, Lq]
 
-    if gate_fn == "relu":
+    if gate_fn == "hard":
+        # step gate ("replace" mode): apply weight alpha exactly on tokens whose
+        # value poorly matches memory (vsim < tau), 0 elsewhere. With alpha=1.0
+        # this REPLACES those tokens' value by pv_match (delete + fill), leaving
+        # well-matched tokens untouched; alpha<1.0 partially blends the selected.
+        g = alpha * (vsim < tau).to(vsim.dtype)                          # [B, Lq]
+    elif gate_fn == "relu":
         # piecewise-linear soft threshold; exactly 0 once vsim >= tau.
         g = alpha * torch.clamp((tau - vsim) / tau, min=0.0)             # [B, Lq]
     else:  # "sigmoid"
@@ -793,7 +819,9 @@ class CausalWanSelfAttention(nn.Module):
                  mem_value_refine_blocks="all",
                  mem_value_refine_norm_restore=True,
                  mem_value_refine_aggregate="top1",
-                 mem_value_refine_temp=0.1):
+                 mem_value_refine_temp=0.1,
+                 mem_value_refine_update_size=0,
+                 clean_recent_attn_scale=1.0):
         """
         Args:
             sink_size: number of sink frames to preserve at the beginning
@@ -844,6 +872,13 @@ class CausalWanSelfAttention(nn.Module):
         self.mem_value_refine_norm_restore = mem_value_refine_norm_restore
         self.mem_value_refine_aggregate = mem_value_refine_aggregate
         self.mem_value_refine_temp = mem_value_refine_temp
+        # exp6: >0 splits the eviction past window into [update N frame (refined) |
+        # recent 1 (raw)]; the frame(s) entering the update region each roll are
+        # value-refined once and persisted to the cache. 0 = off (no-op).
+        self.mem_value_refine_update_size = mem_value_refine_update_size
+        # exp5: scale (<1 attenuates) attention to RECENT keys during the clean
+        # k/v prediction pass. 1.0 = no change (default).
+        self.clean_recent_attn_scale = clean_recent_attn_scale
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
         if not isinstance(local_attn_size, int) and hasattr(local_attn_size, "__iter__"):
             values = list(local_attn_size)
@@ -1432,6 +1467,33 @@ class CausalWanSelfAttention(nn.Module):
                         temp_k[:, write_start_index:local_end_index] = k[:, roped_offset:roped_offset + write_len]
                         temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
 
+                    # exp6: split the past window into [update N (refined) | recent 1 (raw)].
+                    # After the roll, the frame(s) that just crossed recent->update occupy
+                    # [u_end - num_new_tokens, u_end) (= the whole update region when
+                    # roll==update_size). Refine ONLY those (recent/curr stay raw), and stage
+                    # them so _apply_cache_updates persists them into cache["v"] (the smem_src_v
+                    # mirror stays raw -> shadow memory folds the original). No-op unless the
+                    # flag is on, shadow memory is ready, and the window is full.
+                    refined_update_v = None
+                    _u_start = sink_tokens
+                    _u_end = sink_tokens + self.mem_value_refine_update_size * frame_seqlen
+                    _r_start = _u_end - num_new_tokens
+                    if (self.mem_value_refine_update_size > 0
+                            and kv_cache.get("smem_init", False)
+                            and (self.mem_value_refine_blocks is None
+                                 or self.block_index in self.mem_value_refine_blocks)
+                            and _r_start >= _u_start
+                            and (local_end_index - num_new_tokens) >= _u_end + frame_seqlen):
+                        refined_update_v = _refine_value_with_memory(
+                            temp_k[:, _r_start:_u_end], temp_v[:, _r_start:_u_end],
+                            kv_cache["smem_long_k"], kv_cache["smem_long_v"],
+                            gate_mode=self.mem_value_refine_gate, tau=self.mem_value_refine_tau,
+                            beta=self.mem_value_refine_beta, alpha=self.mem_value_refine_alpha,
+                            gate_fn=self.mem_value_refine_gate_fn,
+                            norm_restore=self.mem_value_refine_norm_restore,
+                            aggregate=self.mem_value_refine_aggregate, temp=self.mem_value_refine_temp)
+                        temp_v[:, _r_start:_u_end] = refined_update_v
+
                     # === RoPE Application for Eviction (Block-Relativistic, same as main) ===
                     num_cache_frames = local_end_index // frame_seqlen
                     cache_grid_sizes = grid_sizes.clone()
@@ -1473,8 +1535,14 @@ class CausalWanSelfAttention(nn.Module):
                         "new_k": k[:, roped_offset:roped_offset + write_len],
                         "new_v": v[:, roped_offset:roped_offset + write_len],
                         # exp5(B): original value for the smem_src_v mirror (here == new_v,
-                        # since refinement never happens on this rolling first-denoising pass).
+                        # since curr is not refined on this rolling first-denoising pass).
                         "new_v_orig": v[:, roped_offset:roped_offset + write_len],
+                        # exp6: refined update-region value to persist into cache["v"]
+                        # after the roll (None unless flag on -> not written). smem_src_v
+                        # is left raw so shadow memory still folds the original.
+                        "refined_update_v": refined_update_v,
+                        "update_write_start": _r_start,
+                        "update_write_end": _u_end,
                         "new_q": q[:, roped_offset:roped_offset + write_len],  # For Deep Forcing
                         "new_temporal_indices": new_temporal_indices,  # [write_len]
                         "new_spatial_indices": new_spatial_indices,    # [write_len]
@@ -1599,7 +1667,11 @@ class CausalWanSelfAttention(nn.Module):
                     _ka_want_v1 = _KEY_ATTEND_LOG is not None and _KEY_ATTEND_TIMESTEP is not None
                     _ka_want_v2 = (_KEY_ATTEND_MAP_DIR is not None and _KEY_ATTEND_TIMESTEP is not None
                                    and _ka_chunk in _KEY_ATTEND_MAP_CHUNKS)
-                    if (_ka_want_v1 or _ka_want_v2) and local_start_for_window == sink_tokens:
+                    # exp5: same attention-weight overlay but on the CLEAN pass
+                    # (clean k/v prediction), gated by _KEY_ATTEND_TIMESTEP is None.
+                    _ka_want_clean = (_KEY_ATTEND_MAP_CLEAN_DIR is not None and _KEY_ATTEND_TIMESTEP is None
+                                      and _ka_chunk in _KEY_ATTEND_MAP_CLEAN_CHUNKS)
+                    if (_ka_want_v1 or _ka_want_v2 or _ka_want_clean) and local_start_for_window == sink_tokens:
                         # Whether the cache currently holds mem prototypes. Do NOT
                         # infer this from cache_update_info["action"]: only the first
                         # denoising pass of a chunk takes the ROLLING path
@@ -1637,26 +1709,46 @@ class CausalWanSelfAttention(nn.Module):
                             _record_key_attend_map(_ka_chunk, self.block_index, _KEY_ATTEND_TIMESTEP,
                                                    roped_query, k_cat, _ka_groups,
                                                    num_new_frames, frame_seqlen, grid_sizes)
+                        if _ka_want_clean:
+                            # clean pass has no denoising timestep; tag t=0.
+                            _record_key_attend_map(_ka_chunk, self.block_index, 0,
+                                                   roped_query, k_cat, _ka_groups,
+                                                   num_new_frames, frame_seqlen, grid_sizes,
+                                                   out_dir=_KEY_ATTEND_MAP_CLEAN_DIR)
 
-                    # exp3 mem_logn_bias: add log(n_i) to memory-key logits (cluster-mode,
-                    # full window, mem resident). FA2 exposes no bias hook, so route
-                    # through SDPA when on; off => unchanged flash path below.
-                    _use_logn = (self.mem_logn_bias and self.compression_method == 'cluster'
-                                 and local_start_for_window == sink_tokens
-                                 and local_end_index >= sink_tokens + 2 * frame_seqlen
-                                 and (kv_cache.get("ema_initialized")
-                                      or (cache_update_info and cache_update_info.get("action") == "ema")))
+                    # Build an optional additive attention-logit bias (routed through
+                    # SDPA; FA2 exposes no bias hook). Two independent contributors,
+                    # both only when the full window is attended (indices line up):
+                    #  - exp3 mem_logn_bias: +log(n_i) on memory keys (cluster, mem resident)
+                    #  - exp5 clean_recent_attn_scale: +log(scale) on RECENT keys during
+                    #    the CLEAN pass only, to attenuate (scale<1) how much the clean
+                    #    k/v prediction attends to recent tokens.
+                    _attn_bias = None
+                    _full_win = (local_start_for_window == sink_tokens)
+                    _mem_resident = (self.compression_method in ('ema', 'cluster')
+                                     and local_end_index >= sink_tokens + 2 * frame_seqlen
+                                     and (kv_cache.get("ema_initialized")
+                                          or (cache_update_info and cache_update_info.get("action") == "ema")))
+                    if self.mem_logn_bias and self.compression_method == 'cluster' and _full_win and _mem_resident:
+                        _n_long = mem_count_long_new if mem_count_long_new is not None else kv_cache.get("mem_count_long")
+                        _n_short = mem_count_short_new if mem_count_short_new is not None else kv_cache.get("mem_count_short")
+                        _attn_bias = _mem_logn_bias_vec(sink_tokens, frame_seqlen, k_cat.shape[1],
+                                                        _n_long, _n_short, roped_query.dtype)
+                    if (self.clean_recent_attn_scale != 1.0 and _KEY_ATTEND_TIMESTEP is None and _full_win):
+                        _rec_start = (sink_tokens + 2 * frame_seqlen) if _mem_resident else sink_tokens
+                        _rec_end = local_end_index - num_new_tokens
+                        if _rec_end > _rec_start:
+                            _rb = torch.zeros(k_cat.shape[1], device=roped_query.device, dtype=torch.float32)
+                            _rb[_rec_start:_rec_end] = math.log(max(float(self.clean_recent_attn_scale), 1e-6))
+                            _rb = _rb.unsqueeze(0).to(roped_query.dtype)   # [1, Lk] -> broadcast over batch
+                            _attn_bias = _rb if _attn_bias is None else (_attn_bias + _rb)
                 else:
                     k_cat = k_sink
                     v_cat = v_sink
-                    _use_logn = False
+                    _attn_bias = None
 
-                if _use_logn:
-                    _n_long = mem_count_long_new if mem_count_long_new is not None else kv_cache.get("mem_count_long")
-                    _n_short = mem_count_short_new if mem_count_short_new is not None else kv_cache.get("mem_count_short")
-                    _logn_bias = _mem_logn_bias_vec(sink_tokens, frame_seqlen, k_cat.shape[1],
-                                                    _n_long, _n_short, roped_query.dtype)
-                    x = _sdpa_attn_with_bias(roped_query, k_cat, v_cat, _logn_bias)
+                if _attn_bias is not None:
+                    x = _sdpa_attn_with_bias(roped_query, k_cat, v_cat, _attn_bias)
                 else:
                     x = attention(
                         roped_query,
@@ -1715,7 +1807,9 @@ class CausalWanAttentionBlock(nn.Module):
                  mem_value_refine_blocks="all",
                  mem_value_refine_norm_restore=True,
                  mem_value_refine_aggregate="top1",
-                 mem_value_refine_temp=0.1):
+                 mem_value_refine_temp=0.1,
+                 mem_value_refine_update_size=0,
+                 clean_recent_attn_scale=1.0):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -1727,7 +1821,7 @@ class CausalWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, recent_size, qk_norm, eps, use_block_rope, compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive, mem_logn_bias, mem_key_renorm, mem_side_buffer, mem_value_refine, mem_value_refine_gate, mem_value_refine_tau, mem_value_refine_beta, mem_value_refine_alpha, mem_value_refine_gate_fn, mem_value_refine_blocks, mem_value_refine_norm_restore, mem_value_refine_aggregate, mem_value_refine_temp)
+        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, recent_size, qk_norm, eps, use_block_rope, compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive, mem_logn_bias, mem_key_renorm, mem_side_buffer, mem_value_refine, mem_value_refine_gate, mem_value_refine_tau, mem_value_refine_beta, mem_value_refine_alpha, mem_value_refine_gate_fn, mem_value_refine_blocks, mem_value_refine_norm_restore, mem_value_refine_aggregate, mem_value_refine_temp, mem_value_refine_update_size, clean_recent_attn_scale)
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -1888,7 +1982,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  mem_value_refine_blocks="all",
                  mem_value_refine_norm_restore=True,
                  mem_value_refine_aggregate="top1",
-                 mem_value_refine_temp=0.1):
+                 mem_value_refine_temp=0.1,
+                 mem_value_refine_update_size=0,
+                 clean_recent_attn_scale=1.0):
         r"""
         Initialize the diffusion model backbone.
 
@@ -1968,7 +2064,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                                     compression_method, ema_alpha_long, ema_alpha_short, ema_adaptive,
                                     mem_logn_bias, mem_key_renorm, mem_side_buffer,
                                     mem_value_refine, mem_value_refine_gate, mem_value_refine_tau,
-                                    mem_value_refine_beta, mem_value_refine_alpha, mem_value_refine_gate_fn, mem_value_refine_blocks, mem_value_refine_norm_restore, mem_value_refine_aggregate, mem_value_refine_temp)
+                                    mem_value_refine_beta, mem_value_refine_alpha, mem_value_refine_gate_fn, mem_value_refine_blocks, mem_value_refine_norm_restore, mem_value_refine_aggregate, mem_value_refine_temp, mem_value_refine_update_size, clean_recent_attn_scale)
             for _ in range(num_layers)
         ])
         # Tag each self-attention with its block index (for per-block instrumentation).
@@ -2184,6 +2280,16 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                             cache["token_temporal_indices"][:, write_start_index:write_end_index] = new_temporal_indices
                         if new_spatial_indices is not None and "token_spatial_indices" in cache:
                             cache["token_spatial_indices"][:, write_start_index:write_end_index] = new_spatial_indices
+
+                    # exp6: persist the refined update-region value into cache["v"] AFTER
+                    # the roll (which shifted raw values in) and the new_v insert. Only the
+                    # update slot is overwritten; recent/curr/sink stay raw. smem_src_v is
+                    # left raw (rolled above) so shadow memory still evicts the original.
+                    _ruv = update_info.get("refined_update_v")
+                    if _ruv is not None:
+                        _rs = update_info["update_write_start"]
+                        _re = update_info["update_write_end"]
+                        cache["v"][:, _rs:_re] = _ruv
 
                     # exp4 shadow memory: persist updated side prototypes (only when
                     # mem_side_buffer produced them this pass; None on recompute/off).
